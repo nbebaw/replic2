@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: replic2
+  namespace: replic2
+  labels:
+    app: replic2
+spec:
+  selector:
+    app: replic2
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
