@@ -13,11 +13,10 @@ COPY . .
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o replic2 .
 
-# Final stage — minimal image
-# We use scratch (no OS) but must include:
-#   - The static binary
-#   - CA certificates (needed to verify the Kubernetes API server TLS cert)
-FROM scratch
+# Final stage — busybox:musl gives us a minimal shell (sh, ls, find, cat, …)
+# while keeping the image tiny (~2 MB base vs scratch).
+# CA certificates are copied from the builder for Kubernetes API server TLS.
+FROM busybox:musl
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/replic2 /replic2
