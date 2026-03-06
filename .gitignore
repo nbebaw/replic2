@@ -27,6 +27,11 @@ go.work.sum
 # env file
 .env
 
+deploy/
+CLAUDE.md
+AGENTS.md
+txt
+
 # Editor/IDE
 # .idea/
 # .vscode/
