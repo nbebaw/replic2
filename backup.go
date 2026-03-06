@@ -367,23 +367,39 @@ func backupResourceType(ctx context.Context, c *clients, ns, storagePath string,
 	return nil
 }
 
-// patchBackupStatus writes the updated status back to the API server via the
-// /status subresource using the dynamic client.
+// patchBackupStatus writes only the status sub-object back to the API server.
+//
+// We send a merge-patch that contains only {"status": {...}} — this avoids
+// resource-version conflicts because the /status subresource ignores the
+// top-level resourceVersion field in a merge-patch.
+// Falls back to a full Update (with a fresh Get to get the latest
+// resourceVersion) when the CRD has no /status subresource.
 func patchBackupStatus(ctx context.Context, c *clients, gvr schema.GroupVersionResource, b *Backup) error {
-	raw, err := json.Marshal(b)
+	statusOnly, err := json.Marshal(map[string]interface{}{"status": b.Status})
 	if err != nil {
-		return fmt.Errorf("marshal backup: %w", err)
+		return fmt.Errorf("marshal status: %w", err)
 	}
 
 	_, err = c.dynamic.Resource(gvr).
-		Patch(ctx, b.Name, "application/merge-patch+json", raw, metav1.PatchOptions{}, "status")
-	if err != nil {
-		// Subresource patch may fail if the CRD has no /status sub-resource yet;
-		// fall back to a full update.
-		u := b.unstructured()
-		_, err = c.dynamic.Resource(gvr).Update(ctx, &u, metav1.UpdateOptions{})
+		Patch(ctx, b.Name, "application/merge-patch+json", statusOnly, metav1.PatchOptions{}, "status")
+	if err == nil {
+		return nil
 	}
-	return err
+
+	// Fallback: re-fetch the latest version, overwrite status, and Update.
+	latest, getErr := c.dynamic.Resource(gvr).Get(ctx, b.Name, metav1.GetOptions{})
+	if getErr != nil {
+		return fmt.Errorf("patch status (subresource): %v; re-fetch: %w", err, getErr)
+	}
+	raw, _ := json.Marshal(b.Status)
+	var statusMap map[string]interface{}
+	_ = json.Unmarshal(raw, &statusMap)
+	latest.Object["status"] = statusMap
+	_, updateErr := c.dynamic.Resource(gvr).Update(ctx, latest, metav1.UpdateOptions{})
+	if updateErr != nil {
+		return fmt.Errorf("patch status (subresource): %v; update fallback: %w", err, updateErr)
+	}
+	return nil
 }
 
 // markBackupFailed sets phase → Failed and returns the original error.

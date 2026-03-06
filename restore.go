@@ -371,21 +371,35 @@ func gvrFromUnstructured(c *clients, u *unstructured.Unstructured) (schema.Group
 	return schema.GroupVersionResource{}, fmt.Errorf("no resource found for GVK %s", gvk)
 }
 
-// patchRestoreStatus writes the updated status back via the dynamic client.
+// patchRestoreStatus writes only the status sub-object back via the dynamic client.
+// Uses the same status-only merge-patch strategy as patchBackupStatus to avoid
+// resource-version conflicts between the InProgress and Completed patches.
 func patchRestoreStatus(ctx context.Context, c *clients, gvr schema.GroupVersionResource, r *Restore) error {
-	raw, err := json.Marshal(r)
+	statusOnly, err := json.Marshal(map[string]interface{}{"status": r.Status})
 	if err != nil {
-		return fmt.Errorf("marshal restore: %w", err)
+		return fmt.Errorf("marshal status: %w", err)
 	}
 
 	_, err = c.dynamic.Resource(gvr).
-		Patch(ctx, r.Name, "application/merge-patch+json", raw, metav1.PatchOptions{}, "status")
-	if err != nil {
-		u := unstructured.Unstructured{}
-		_ = json.Unmarshal(raw, &u.Object)
-		_, err = c.dynamic.Resource(gvr).Update(ctx, &u, metav1.UpdateOptions{})
+		Patch(ctx, r.Name, "application/merge-patch+json", statusOnly, metav1.PatchOptions{}, "status")
+	if err == nil {
+		return nil
 	}
-	return err
+
+	// Fallback: re-fetch, overwrite status, and Update.
+	latest, getErr := c.dynamic.Resource(gvr).Get(ctx, r.Name, metav1.GetOptions{})
+	if getErr != nil {
+		return fmt.Errorf("patch status (subresource): %v; re-fetch: %w", err, getErr)
+	}
+	raw, _ := json.Marshal(r.Status)
+	var statusMap map[string]interface{}
+	_ = json.Unmarshal(raw, &statusMap)
+	latest.Object["status"] = statusMap
+	_, updateErr := c.dynamic.Resource(gvr).Update(ctx, latest, metav1.UpdateOptions{})
+	if updateErr != nil {
+		return fmt.Errorf("patch status (subresource): %v; update fallback: %w", err, updateErr)
+	}
+	return nil
 }
 
 // markRestoreFailed sets phase → Failed and returns the original error.
