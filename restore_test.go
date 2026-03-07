@@ -342,12 +342,12 @@ func TestBoolPtr(t *testing.T) {
 	// boolPtr is now package-private in restore; verify the behaviour inline.
 	trueVal := true
 	p := &trueVal
-	if p == nil || !*p {
-		t.Error("pointer to true should be non-nil and true")
+	if !*p {
+		t.Error("pointer to true should be true")
 	}
 	falseVal := false
 	p2 := &falseVal
-	if p2 == nil || *p2 {
-		t.Error("pointer to false should be non-nil and false")
+	if *p2 {
+		t.Error("pointer to false should be false")
 	}
 }
