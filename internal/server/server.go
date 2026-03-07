@@ -40,9 +40,10 @@ type HelloResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
-type backResponse struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
+type backupResponse struct {
+	Name        string `json:"name"`
+	Phase       string `json:"phase"`
+	CompletedAt string `json:"completedAt,omitempty"`
 }
 
 // GVR is the GroupVersionResource for the Backup CRD.
@@ -71,6 +72,15 @@ func backupHandler(c *gin.Context, clients *k8s.Clients) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	for _, item := range list.Items {
+		// Strip fields that must not be re-applied verbatim.
+		c.JSON(http.StatusOK, backupResponse{
+			Name:        item.Object["metadata"].(map[string]interface{})["name"].(string),
+			Phase:       item.Object["status"].(map[string]interface{})["phase"].(string),
+			CompletedAt: item.Object["status"].(map[string]interface{})["completedAt"].(string),
+		})
+
 	}
 	c.JSON(http.StatusOK, list)
 }
