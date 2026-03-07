@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 var startTime = time.Now()
@@ -60,35 +61,41 @@ func version() string {
 }
 
 // -----------------------------------------------------------------------
-// HTTP handlers
+// HTTP handlers (gin)
 // -----------------------------------------------------------------------
 
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	resp := HelloResponse{
+func helloHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, HelloResponse{
 		Message:   "Hello from replic2!",
 		App:       "replic2",
 		Version:   version(),
 		Hostname:  hostname(),
 		Namespace: namespace(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	})
 }
 
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	resp := HealthResponse{
+func healthzHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, HealthResponse{
 		Status:   "ok",
 		Uptime:   time.Since(startTime).Round(time.Second).String(),
 		Hostname: hostname(),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	})
 }
 
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+func readyzHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+}
+
+// newRouter builds and returns a configured gin.Engine.
+// Extracted so tests can create the router without starting a real server.
+func newRouter() *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.GET("/", helloHandler)
+	r.GET("/healthz", healthzHandler)
+	r.GET("/readyz", readyzHandler)
+	return r
 }
 
 // -----------------------------------------------------------------------
@@ -111,14 +118,13 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", helloHandler)
-	mux.HandleFunc("/healthz", healthzHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
+
+	gin.SetMode(gin.ReleaseMode)
+	router := newRouter()
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", port),
-		Handler: mux,
+		Handler: router,
 	}
 
 	go func() {

@@ -3,6 +3,7 @@ package main
 // main_test.go — unit tests for the HTTP handlers.
 //
 // Uses net/http/httptest so no real server is started.
+// Routes are exercised through newRouter() which returns the gin.Engine.
 
 import (
 	"encoding/json"
@@ -11,17 +12,24 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
+
+func init() {
+	gin.SetMode(gin.TestMode)
+}
 
 // -----------------------------------------------------------------------
 // helloHandler
 // -----------------------------------------------------------------------
 
 func TestHelloHandler_StatusOK(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 
-	helloHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("helloHandler status = %d; want %d", rr.Code, http.StatusOK)
@@ -29,10 +37,11 @@ func TestHelloHandler_StatusOK(t *testing.T) {
 }
 
 func TestHelloHandler_ContentTypeJSON(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 
-	helloHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	ct := rr.Header().Get("Content-Type")
 	if !strings.Contains(ct, "application/json") {
@@ -41,10 +50,11 @@ func TestHelloHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestHelloHandler_BodyFields(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 
-	helloHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	var resp HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
@@ -72,9 +82,10 @@ func TestHelloHandler_BodyFields(t *testing.T) {
 func TestHelloHandler_VersionFromEnv(t *testing.T) {
 	t.Setenv("APP_VERSION", "9.9.9")
 
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
-	helloHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	var resp HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
@@ -88,9 +99,10 @@ func TestHelloHandler_VersionFromEnv(t *testing.T) {
 func TestHelloHandler_NamespaceFromEnv(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "production")
 
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
-	helloHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	var resp HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
@@ -106,10 +118,11 @@ func TestHelloHandler_NamespaceFromEnv(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestHealthzHandler_StatusOK(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 
-	healthzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("healthzHandler status = %d; want %d", rr.Code, http.StatusOK)
@@ -117,10 +130,11 @@ func TestHealthzHandler_StatusOK(t *testing.T) {
 }
 
 func TestHealthzHandler_ContentTypeJSON(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 
-	healthzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	ct := rr.Header().Get("Content-Type")
 	if !strings.Contains(ct, "application/json") {
@@ -129,10 +143,11 @@ func TestHealthzHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestHealthzHandler_BodyFields(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 
-	healthzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	var resp HealthResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
@@ -154,10 +169,11 @@ func TestHealthzHandler_BodyFields(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestReadyzHandler_StatusOK(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 
-	readyzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("readyzHandler status = %d; want %d", rr.Code, http.StatusOK)
@@ -165,10 +181,11 @@ func TestReadyzHandler_StatusOK(t *testing.T) {
 }
 
 func TestReadyzHandler_ContentTypeJSON(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 
-	readyzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	ct := rr.Header().Get("Content-Type")
 	if !strings.Contains(ct, "application/json") {
@@ -177,10 +194,11 @@ func TestReadyzHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestReadyzHandler_BodyReady(t *testing.T) {
+	r := newRouter()
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 
-	readyzHandler(rr, req)
+	r.ServeHTTP(rr, req)
 
 	var resp map[string]string
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
