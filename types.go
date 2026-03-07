@@ -24,13 +24,15 @@ var SchemeGroupVersion = schema.GroupVersion{
 	Version: "v1alpha1",
 }
 
-// addToScheme registers Backup and Restore with the given runtime.Scheme.
+// addToScheme registers Backup, Restore, and ScheduledBackup with the given runtime.Scheme.
 func addToScheme(s *runtime.Scheme) error {
 	s.AddKnownTypes(SchemeGroupVersion,
 		&Backup{},
 		&BackupList{},
 		&Restore{},
 		&RestoreList{},
+		&ScheduledBackup{},
+		&ScheduledBackupList{},
 	)
 	metav1.AddToGroupVersion(s, SchemeGroupVersion)
 	return nil
@@ -191,6 +193,85 @@ func (rl *RestoreList) DeepCopyObject() runtime.Object {
 		out.Items = make([]Restore, len(rl.Items))
 		for i := range rl.Items {
 			item := *rl.Items[i].DeepCopyObject().(*Restore)
+			out.Items[i] = item
+		}
+	}
+	return out
+}
+
+// -----------------------------------------------------------------------
+// ScheduledBackup CRD types
+// -----------------------------------------------------------------------
+
+// ScheduledBackupSpec defines the schedule and retention policy.
+type ScheduledBackupSpec struct {
+	// Namespace is the Kubernetes namespace to back up on each run.
+	Namespace string `json:"namespace"`
+	// Schedule is a standard 5-field cron expression (e.g. "0 2 * * *").
+	Schedule string `json:"schedule"`
+	// KeepLast is the number of most-recent Backup CRs (and their PVC data)
+	// to retain. Older ones are deleted automatically. 0 means keep all.
+	KeepLast int `json:"keepLast,omitempty"`
+	// TTL is an optional Go duration (e.g. "24h") applied to every generated
+	// Backup CR so that the TTL controller also prunes them if keepLast is not set.
+	TTL string `json:"ttl,omitempty"`
+}
+
+// ScheduledBackupStatus is written back by the controller.
+type ScheduledBackupStatus struct {
+	// LastScheduleTime is when the most recent Backup CR was created.
+	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
+	// LastBackupName is the name of the most recently created Backup CR.
+	LastBackupName string `json:"lastBackupName,omitempty"`
+	// ActiveBackups is the number of Backup CRs currently owned by this schedule.
+	ActiveBackups int `json:"activeBackups,omitempty"`
+	// Message is a human-readable status string.
+	Message string `json:"message,omitempty"`
+}
+
+// ScheduledBackup is the Schema for the scheduledbackups.replic2.io CRD.
+type ScheduledBackup struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   ScheduledBackupSpec   `json:"spec"`
+	Status ScheduledBackupStatus `json:"status,omitempty"`
+}
+
+// ScheduledBackupList is the list wrapper required by the API machinery.
+type ScheduledBackupList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+
+	Items []ScheduledBackup `json:"items"`
+}
+
+// DeepCopyObject implements runtime.Object for ScheduledBackup.
+func (sb *ScheduledBackup) DeepCopyObject() runtime.Object {
+	out := new(ScheduledBackup)
+	*out = *sb
+	out.TypeMeta = sb.TypeMeta
+	out.ObjectMeta = *sb.ObjectMeta.DeepCopy()
+	out.Spec = sb.Spec
+	if sb.Status.LastScheduleTime != nil {
+		t := *sb.Status.LastScheduleTime
+		out.Status.LastScheduleTime = &t
+	}
+	out.Status.LastBackupName = sb.Status.LastBackupName
+	out.Status.ActiveBackups = sb.Status.ActiveBackups
+	out.Status.Message = sb.Status.Message
+	return out
+}
+
+// DeepCopyObject implements runtime.Object for ScheduledBackupList.
+func (sbl *ScheduledBackupList) DeepCopyObject() runtime.Object {
+	out := new(ScheduledBackupList)
+	out.TypeMeta = sbl.TypeMeta
+	out.ListMeta = sbl.ListMeta
+	if sbl.Items != nil {
+		out.Items = make([]ScheduledBackup, len(sbl.Items))
+		for i := range sbl.Items {
+			item := *sbl.Items[i].DeepCopyObject().(*ScheduledBackup)
 			out.Items[i] = item
 		}
 	}

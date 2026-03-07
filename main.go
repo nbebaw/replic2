@@ -135,6 +135,7 @@ func main() {
 	go runWithLeaderElection(ctx, c, func(leaderCtx context.Context) {
 		go runBackupController(leaderCtx, c)
 		go runRestoreController(leaderCtx, c)
+		go runScheduledBackupController(leaderCtx, c)
 		<-leaderCtx.Done()
 	})
 
