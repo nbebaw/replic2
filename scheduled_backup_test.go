@@ -14,11 +14,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+
+	backupctl "replic2/internal/controller/backup"
+	scheduledctl "replic2/internal/controller/scheduled"
+	"replic2/internal/k8s"
+	"replic2/internal/types"
 )
 
 // newTestClientsWithScheduleScheme registers Backup and ScheduledBackup kinds
 // in the fake dynamic client scheme.
-func newTestClientsWithScheduleScheme(objects ...runtime.Object) *clients {
+func newTestClientsWithScheduleScheme(objects ...runtime.Object) *k8s.Clients {
 	scheme := runtime.NewScheme()
 	for _, info := range []struct{ kind, list, group, version string }{
 		{"Backup", "BackupList", "replic2.io", "v1alpha1"},
@@ -35,18 +40,18 @@ func newTestClientsWithScheduleScheme(objects ...runtime.Object) *clients {
 	}
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, objects...)
 	core := kubernetesfake.NewSimpleClientset()
-	return &clients{core: core, dynamic: dyn, discovery: core.Discovery()}
+	return &k8s.Clients{Core: core, Dynamic: dyn, Discovery: core.Discovery()}
 }
 
 // makeScheduledBackupUnstructured builds a ScheduledBackup unstructured object.
 func makeScheduledBackupUnstructured(name, namespace, schedule string, keepLast int, lastRunTime *time.Time) *unstructured.Unstructured {
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "replic2.io/v1alpha1",
 			Kind:       "ScheduledBackup",
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: ScheduledBackupSpec{
+		Spec: types.ScheduledBackupSpec{
 			Namespace: namespace,
 			Schedule:  schedule,
 			KeepLast:  keepLast,
@@ -63,7 +68,7 @@ func makeScheduledBackupUnstructured(name, namespace, schedule string, keepLast 
 }
 
 // -----------------------------------------------------------------------
-// reconcileScheduledBackup() — due / not due
+// ReconcileOne() — due / not due
 // -----------------------------------------------------------------------
 
 func TestReconcileScheduledBackup_FiresWhenDue(t *testing.T) {
@@ -73,26 +78,24 @@ func TestReconcileScheduledBackup_FiresWhenDue(t *testing.T) {
 	sbObj := makeScheduledBackupUnstructured("every-minute", "demo-app", "* * * * *", 0, &lastRun)
 	c := newTestClientsWithScheduleScheme(sbObj)
 
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "every-minute"},
-		Spec: ScheduledBackupSpec{
+		Spec: types.ScheduledBackupSpec{
 			Namespace: "demo-app",
 			Schedule:  "* * * * *",
 		},
-		Status: ScheduledBackupStatus{
+		Status: types.ScheduledBackupStatus{
 			LastScheduleTime: func() *metav1.Time { t := metav1.NewTime(lastRun); return &t }(),
 		},
 	}
 
 	ctx := context.Background()
-	if err := reconcileScheduledBackup(ctx, c, sb); err != nil {
-		t.Fatalf("reconcileScheduledBackup error: %v", err)
+	if err := scheduledctl.ReconcileOne(ctx, c, sb); err != nil {
+		t.Fatalf("ReconcileOne error: %v", err)
 	}
 
 	// A Backup CR should have been created.
-	list, err := c.dynamic.Resource(schema.GroupVersionResource{
-		Group: "replic2.io", Version: "v1alpha1", Resource: "backups",
-	}).List(ctx, metav1.ListOptions{})
+	list, err := c.Dynamic.Resource(backupctl.GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list backups: %v", err)
 	}
@@ -101,8 +104,8 @@ func TestReconcileScheduledBackup_FiresWhenDue(t *testing.T) {
 	}
 	// Verify the label is set.
 	labels := list.Items[0].GetLabels()
-	if labels[scheduledByLabel] != "every-minute" {
-		t.Errorf("scheduled-by label = %q; want every-minute", labels[scheduledByLabel])
+	if labels[scheduledctl.ScheduledByLabel] != "every-minute" {
+		t.Errorf("scheduled-by label = %q; want every-minute", labels[scheduledctl.ScheduledByLabel])
 	}
 }
 
@@ -111,26 +114,24 @@ func TestReconcileScheduledBackup_SkipsWhenNotDue(t *testing.T) {
 	lastRun := time.Now().UTC().Add(-10 * time.Second)
 	c := newTestClientsWithScheduleScheme()
 
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "hourly"},
-		Spec: ScheduledBackupSpec{
+		Spec: types.ScheduledBackupSpec{
 			Namespace: "demo-app",
 			Schedule:  "0 * * * *", // every hour
 		},
-		Status: ScheduledBackupStatus{
+		Status: types.ScheduledBackupStatus{
 			LastScheduleTime: func() *metav1.Time { t := metav1.NewTime(lastRun); return &t }(),
 		},
 	}
 
 	ctx := context.Background()
-	if err := reconcileScheduledBackup(ctx, c, sb); err != nil {
-		t.Fatalf("reconcileScheduledBackup error: %v", err)
+	if err := scheduledctl.ReconcileOne(ctx, c, sb); err != nil {
+		t.Fatalf("ReconcileOne error: %v", err)
 	}
 
 	// No Backup CR should have been created.
-	list, err := c.dynamic.Resource(schema.GroupVersionResource{
-		Group: "replic2.io", Version: "v1alpha1", Resource: "backups",
-	}).List(ctx, metav1.ListOptions{})
+	list, err := c.Dynamic.Resource(backupctl.GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list backups: %v", err)
 	}
@@ -143,22 +144,20 @@ func TestReconcileScheduledBackup_FirstRunFiresImmediately(t *testing.T) {
 	// No lastScheduleTime — should fire on first reconcile.
 	c := newTestClientsWithScheduleScheme()
 
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "first-run"},
-		Spec: ScheduledBackupSpec{
+		Spec: types.ScheduledBackupSpec{
 			Namespace: "demo-app",
 			Schedule:  "0 2 * * *", // daily at 02:00 — irrelevant, first run always fires
 		},
 	}
 
 	ctx := context.Background()
-	if err := reconcileScheduledBackup(ctx, c, sb); err != nil {
-		t.Fatalf("reconcileScheduledBackup error: %v", err)
+	if err := scheduledctl.ReconcileOne(ctx, c, sb); err != nil {
+		t.Fatalf("ReconcileOne error: %v", err)
 	}
 
-	list, err := c.dynamic.Resource(schema.GroupVersionResource{
-		Group: "replic2.io", Version: "v1alpha1", Resource: "backups",
-	}).List(ctx, metav1.ListOptions{})
+	list, err := c.Dynamic.Resource(backupctl.GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list backups: %v", err)
 	}
@@ -168,7 +167,7 @@ func TestReconcileScheduledBackup_FirstRunFiresImmediately(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// reconcileScheduledBackups() — list iteration
+// ReconcileAll() — list iteration
 // -----------------------------------------------------------------------
 
 func TestReconcileScheduledBackups_InvalidScheduleLogsAndContinues(t *testing.T) {
@@ -177,21 +176,21 @@ func TestReconcileScheduledBackups_InvalidScheduleLogsAndContinues(t *testing.T)
 
 	ctx := context.Background()
 	// Should not return an error — bad schedule is logged per-CR, not fatal.
-	if err := reconcileScheduledBackups(ctx, c); err != nil {
-		t.Fatalf("reconcileScheduledBackups error: %v", err)
+	if err := scheduledctl.ReconcileAll(ctx, c); err != nil {
+		t.Fatalf("ReconcileAll error: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------
-// listOwnedBackups() — label selector
+// ListOwnedBackups() — label selector
 // -----------------------------------------------------------------------
 
 func TestListOwnedBackups_ReturnsOnlyOwned(t *testing.T) {
 	makeBackup := func(name, owner string, completedAt time.Time) *unstructured.Unstructured {
-		b := &Backup{
+		b := &types.Backup{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "replic2.io/v1alpha1", Kind: "Backup"},
-			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{scheduledByLabel: owner}},
-			Status:     BackupStatus{Phase: "Completed", CompletedAt: func() *metav1.Time { t := metav1.NewTime(completedAt); return &t }()},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{scheduledctl.ScheduledByLabel: owner}},
+			Status:     types.BackupStatus{Phase: "Completed", CompletedAt: func() *metav1.Time { t := metav1.NewTime(completedAt); return &t }()},
 		}
 		raw, _ := json.Marshal(b)
 		var obj map[string]interface{}
@@ -204,12 +203,11 @@ func TestListOwnedBackups_ReturnsOnlyOwned(t *testing.T) {
 	b3 := makeBackup("sched-b-1", "sched-b", time.Now().Add(-3*time.Minute))
 
 	c := newTestClientsWithScheduleScheme(b1, b2, b3)
-	gvr := schema.GroupVersionResource{Group: "replic2.io", Version: "v1alpha1", Resource: "backups"}
 
 	ctx := context.Background()
-	owned, err := listOwnedBackups(ctx, c, gvr, "sched-a")
+	owned, err := scheduledctl.ListOwnedBackups(ctx, c, "sched-a")
 	if err != nil {
-		t.Fatalf("listOwnedBackups error: %v", err)
+		t.Fatalf("ListOwnedBackups error: %v", err)
 	}
 	if len(owned) != 2 {
 		t.Errorf("expected 2 owned backups for sched-a, got %d", len(owned))
@@ -217,21 +215,21 @@ func TestListOwnedBackups_ReturnsOnlyOwned(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// enforceKeepLast()
+// EnforceKeepLast()
 // -----------------------------------------------------------------------
 
 func TestEnforceKeepLast_DeletesOldest(t *testing.T) {
 	now := time.Now()
 
-	makeCompletedBackup := func(name string, age time.Duration) Backup {
+	makeCompletedBackup := func(name string, age time.Duration) types.Backup {
 		completedAt := metav1.NewTime(now.Add(-age))
 		createdAt := metav1.NewTime(now.Add(-age))
-		return Backup{
+		return types.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:              name,
 				CreationTimestamp: createdAt,
 			},
-			Status: BackupStatus{Phase: "Completed", CompletedAt: &completedAt},
+			Status: types.BackupStatus{Phase: "Completed", CompletedAt: &completedAt},
 		}
 	}
 
@@ -241,7 +239,7 @@ func TestEnforceKeepLast_DeletesOldest(t *testing.T) {
 	newest := makeCompletedBackup("backup-new", 10*time.Minute)
 
 	// Register all three in the fake dynamic client.
-	toUnstructured := func(b Backup) *unstructured.Unstructured {
+	toUnstructured := func(b types.Backup) *unstructured.Unstructured {
 		b.TypeMeta = metav1.TypeMeta{APIVersion: "replic2.io/v1alpha1", Kind: "Backup"}
 		raw, _ := json.Marshal(b)
 		var obj map[string]interface{}
@@ -255,20 +253,20 @@ func TestEnforceKeepLast_DeletesOldest(t *testing.T) {
 		toUnstructured(newest),
 	)
 
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-schedule"},
-		Spec:       ScheduledBackupSpec{KeepLast: 2},
+		Spec:       types.ScheduledBackupSpec{KeepLast: 2},
 	}
-	owned := []Backup{oldest, middle, newest} // already sorted oldest-first
-	gvr := schema.GroupVersionResource{Group: "replic2.io", Version: "v1alpha1", Resource: "backups"}
+	owned := []types.Backup{oldest, middle, newest} // already sorted oldest-first
 
 	ctx := context.Background()
-	if err := enforceKeepLast(ctx, c, gvr, sb, owned); err != nil {
-		t.Fatalf("enforceKeepLast error: %v", err)
+	if err := scheduledctl.EnforceKeepLast(ctx, c, sb, owned); err != nil {
+		t.Fatalf("EnforceKeepLast error: %v", err)
 	}
 
 	// backup-old should be deleted; backup-mid and backup-new should remain.
-	list, err := c.dynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
+	gvr := schema.GroupVersionResource{Group: "replic2.io", Version: "v1alpha1", Resource: "backups"}
+	list, err := c.Dynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list backups: %v", err)
 	}
@@ -289,12 +287,12 @@ func TestEnforceKeepLast_DeletesOldest(t *testing.T) {
 
 func TestEnforceKeepLast_SkipsInProgress(t *testing.T) {
 	now := time.Now()
-	inProgress := Backup{
+	inProgress := types.Backup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              "in-progress-backup",
 			CreationTimestamp: metav1.NewTime(now.Add(-1 * time.Hour)),
 		},
-		Status: BackupStatus{Phase: "InProgress"},
+		Status: types.BackupStatus{Phase: "InProgress"},
 	}
 
 	inProgressU := func() *unstructured.Unstructured {
@@ -306,32 +304,32 @@ func TestEnforceKeepLast_SkipsInProgress(t *testing.T) {
 	}()
 
 	c := newTestClientsWithScheduleScheme(inProgressU)
-	sb := &ScheduledBackup{
+	sb := &types.ScheduledBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-schedule"},
-		Spec:       ScheduledBackupSpec{KeepLast: 0}, // keepLast=0 means keep all anyway
+		Spec:       types.ScheduledBackupSpec{KeepLast: 0}, // keepLast=0 means keep all anyway
+	}
+
+	ctx := context.Background()
+
+	// EnforceKeepLast should not delete an in-progress backup.
+	if err := scheduledctl.EnforceKeepLast(ctx, c, sb, []types.Backup{inProgress}); err != nil {
+		t.Fatalf("EnforceKeepLast error: %v", err)
 	}
 
 	gvr := schema.GroupVersionResource{Group: "replic2.io", Version: "v1alpha1", Resource: "backups"}
-	ctx := context.Background()
-
-	// enforceKeepLast should not delete an in-progress backup.
-	if err := enforceKeepLast(ctx, c, gvr, sb, []Backup{inProgress}); err != nil {
-		t.Fatalf("enforceKeepLast error: %v", err)
-	}
-
-	list, _ := c.dynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
+	list, _ := c.Dynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
 	if len(list.Items) == 0 {
 		t.Error("expected in-progress backup to be preserved")
 	}
 }
 
 // -----------------------------------------------------------------------
-// mustUnstructured()
+// MustUnstructured()
 // -----------------------------------------------------------------------
 
 func TestMustUnstructured_ValidJSON(t *testing.T) {
 	raw := []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"test"}}`)
-	u := mustUnstructured(raw)
+	u := scheduledctl.MustUnstructured(raw)
 	if u.GetName() != "test" {
 		t.Errorf("name = %q; want test", u.GetName())
 	}

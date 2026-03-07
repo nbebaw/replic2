@@ -14,24 +14,21 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	backupctl "replic2/internal/controller/backup"
+	"replic2/internal/k8s"
+	"replic2/internal/store"
+	"replic2/internal/types"
 )
 
-// backupGVR is the GVR for Backup CRs.
-var backupGVR = schema.GroupVersionResource{
-	Group:    "replic2.io",
-	Version:  "v1alpha1",
-	Resource: "backups",
-}
-
-// newTestClients returns a clients instance backed by fake k8s clients.
+// newTestClients returns a k8s.Clients instance backed by fake k8s clients.
 // The scheme is pre-loaded with our CRD types plus any extra objects provided.
-func newTestClients(objects ...runtime.Object) *clients {
+func newTestClients(objects ...runtime.Object) *k8s.Clients {
 	scheme := runtime.NewScheme()
 	// Register our types so the fake dynamic client knows about them.
 	scheme.AddKnownTypeWithName(
@@ -54,17 +51,17 @@ func newTestClients(objects ...runtime.Object) *clients {
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, objects...)
 	core := kubernetesfake.NewSimpleClientset()
 
-	return &clients{
-		core:      core,
-		dynamic:   dyn,
-		discovery: core.Discovery(),
+	return &k8s.Clients{
+		Core:      core,
+		Dynamic:   dyn,
+		Discovery: core.Discovery(),
 	}
 }
 
 // makeBackupUnstructured creates an unstructured Backup object ready to store
 // in the fake dynamic client.
 func makeBackupUnstructured(name, namespace, phase string) *unstructured.Unstructured {
-	b := &Backup{
+	b := &types.Backup{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "replic2.io/v1alpha1",
 			Kind:       "Backup",
@@ -72,8 +69,8 @@ func makeBackupUnstructured(name, namespace, phase string) *unstructured.Unstruc
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: BackupSpec{Namespace: namespace},
-		Status: BackupStatus{
+		Spec: types.BackupSpec{Namespace: namespace},
+		Status: types.BackupStatus{
 			Phase: phase,
 		},
 	}
@@ -84,39 +81,39 @@ func makeBackupUnstructured(name, namespace, phase string) *unstructured.Unstruc
 }
 
 // -----------------------------------------------------------------------
-// backupRoot()
+// BackupRoot()
 // -----------------------------------------------------------------------
 
 func TestBackupRoot_Default(t *testing.T) {
 	os.Unsetenv("BACKUP_ROOT")
-	if got := backupRoot(); got != defaultBackupRoot {
-		t.Errorf("backupRoot() = %q; want %q", got, defaultBackupRoot)
+	if got := store.BackupRoot(); got != store.DefaultBackupRoot {
+		t.Errorf("BackupRoot() = %q; want %q", got, store.DefaultBackupRoot)
 	}
 }
 
 func TestBackupRoot_EnvOverride(t *testing.T) {
 	t.Setenv("BACKUP_ROOT", "/tmp/test-backups")
-	if got := backupRoot(); got != "/tmp/test-backups" {
-		t.Errorf("backupRoot() = %q; want /tmp/test-backups", got)
+	if got := store.BackupRoot(); got != "/tmp/test-backups" {
+		t.Errorf("BackupRoot() = %q; want /tmp/test-backups", got)
 	}
 }
 
 // -----------------------------------------------------------------------
-// verbSupported()
+// VerbSupported()
 // -----------------------------------------------------------------------
 
 func TestVerbSupported(t *testing.T) {
 	verbs := metav1.Verbs{"get", "list", "watch", "create", "update", "patch", "delete"}
-	if !verbSupported(verbs, "list") {
+	if !backupctl.VerbSupported(verbs, "list") {
 		t.Error("expected 'list' to be supported")
 	}
-	if verbSupported(verbs, "nonexistent") {
+	if backupctl.VerbSupported(verbs, "nonexistent") {
 		t.Error("expected 'nonexistent' to NOT be supported")
 	}
 }
 
 // -----------------------------------------------------------------------
-// reconcileBackups() — skip already-processed CRs
+// ReconcileBackups() — skip already-processed CRs
 // -----------------------------------------------------------------------
 
 func TestReconcileBackups_SkipsCompletedAndFailed(t *testing.T) {
@@ -126,13 +123,13 @@ func TestReconcileBackups_SkipsCompletedAndFailed(t *testing.T) {
 
 	c := newTestClients(completedObj, failedObj, inProgressObj)
 
-	// reconcileBackups should not error; completed/failed/in-progress CRs must
+	// ReconcileBackups should not error; completed/failed/in-progress CRs must
 	// be skipped without spawning goroutines that would try to patch status.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileBackups(ctx, c); err != nil {
-		t.Fatalf("reconcileBackups returned unexpected error: %v", err)
+	if err := backupctl.ReconcileBackups(ctx, c); err != nil {
+		t.Fatalf("ReconcileBackups returned unexpected error: %v", err)
 	}
 }
 
@@ -140,14 +137,14 @@ func TestReconcileBackups_PicksPending(t *testing.T) {
 	pendingObj := makeBackupUnstructured("pending-backup", "target-ns", "Pending")
 	c := newTestClients(pendingObj)
 
-	// We only verify that reconcileBackups returns without error.
+	// We only verify that ReconcileBackups returns without error.
 	// The goroutine spawned for the pending backup will attempt a status patch
 	// which will succeed against the fake dynamic client.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileBackups(ctx, c); err != nil {
-		t.Fatalf("reconcileBackups returned unexpected error: %v", err)
+	if err := backupctl.ReconcileBackups(ctx, c); err != nil {
+		t.Fatalf("ReconcileBackups returned unexpected error: %v", err)
 	}
 }
 
@@ -159,13 +156,13 @@ func TestReconcileBackups_PicksEmpty(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileBackups(ctx, c); err != nil {
-		t.Fatalf("reconcileBackups returned unexpected error: %v", err)
+	if err := backupctl.ReconcileBackups(ctx, c); err != nil {
+		t.Fatalf("ReconcileBackups returned unexpected error: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------
-// backupResourceType() — writes YAML files to a temp directory
+// BackupResourceType() — writes YAML files to a temp directory
 // -----------------------------------------------------------------------
 
 func TestBackupResourceType_WritesFiles(t *testing.T) {
@@ -204,17 +201,18 @@ func TestBackupResourceType_WritesFiles(t *testing.T) {
 	)
 
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, cm1, cm2)
-	c := &clients{
-		core:      kubernetesfake.NewSimpleClientset(),
-		dynamic:   dyn,
-		discovery: kubernetesfake.NewSimpleClientset().Discovery(),
+	coreClient := kubernetesfake.NewSimpleClientset()
+	c := &k8s.Clients{
+		Core:      coreClient,
+		Dynamic:   dyn,
+		Discovery: coreClient.Discovery(),
 	}
 
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	if err := backupResourceType(ctx, c, "myns", dir, cmGVR); err != nil {
-		t.Fatalf("backupResourceType error: %v", err)
+	if err := backupctl.BackupResourceType(ctx, c, "myns", dir, cmGVR); err != nil {
+		t.Fatalf("BackupResourceType error: %v", err)
 	}
 
 	// Expect <dir>/configmaps/cfg-one.yaml and cfg-two.yaml.
@@ -253,17 +251,18 @@ func TestBackupResourceType_StripsRuntimeMetadata(t *testing.T) {
 	)
 
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, cm)
-	c := &clients{
-		core:      kubernetesfake.NewSimpleClientset(),
-		dynamic:   dyn,
-		discovery: kubernetesfake.NewSimpleClientset().Discovery(),
+	coreClient := kubernetesfake.NewSimpleClientset()
+	c := &k8s.Clients{
+		Core:      coreClient,
+		Dynamic:   dyn,
+		Discovery: coreClient.Discovery(),
 	}
 
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	if err := backupResourceType(ctx, c, "myns", dir, cmGVR); err != nil {
-		t.Fatalf("backupResourceType error: %v", err)
+	if err := backupctl.BackupResourceType(ctx, c, "myns", dir, cmGVR); err != nil {
+		t.Fatalf("BackupResourceType error: %v", err)
 	}
 
 	path := filepath.Join(dir, "configmaps", "strip-test.yaml")
@@ -306,14 +305,14 @@ func containsHelper(s, substr string) bool {
 }
 
 // -----------------------------------------------------------------------
-// jsonToYAML / decodeYAMLFile round-trip
+// JSONToYAML / ReadYAML round-trip
 // -----------------------------------------------------------------------
 
 func TestJSONToYAML(t *testing.T) {
 	input := []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"test"}}`)
-	out, err := jsonToYAML(input)
+	out, err := store.JSONToYAML(input)
 	if err != nil {
-		t.Fatalf("jsonToYAML error: %v", err)
+		t.Fatalf("JSONToYAML error: %v", err)
 	}
 	if !contains(string(out), "ConfigMap") {
 		t.Error("expected YAML output to contain 'ConfigMap'")
@@ -329,9 +328,9 @@ func TestDecodeYAMLFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	obj, err := decodeYAMLFile(path)
+	obj, err := store.ReadYAML(path)
 	if err != nil {
-		t.Fatalf("decodeYAMLFile error: %v", err)
+		t.Fatalf("ReadYAML error: %v", err)
 	}
 	meta, ok := obj["metadata"].(map[string]interface{})
 	if !ok {
@@ -343,16 +342,16 @@ func TestDecodeYAMLFile(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// discoverCRDTypes() — with the fake discovery client
+// DiscoverCRDTypes() — with the fake discovery client
 // -----------------------------------------------------------------------
 
 func TestDiscoverCRDTypes_ReturnsEmpty_NoExtraCRDs(t *testing.T) {
 	// The fake discovery client from kubernetesfake returns no API groups
-	// by default, so discoverCRDTypes should return an empty slice.
+	// by default, so DiscoverCRDTypes should return an empty slice.
 	c := newTestClients()
-	result, err := discoverCRDTypes(c)
+	result, err := backupctl.DiscoverCRDTypes(c)
 	if err != nil {
-		t.Fatalf("discoverCRDTypes unexpected error: %v", err)
+		t.Fatalf("DiscoverCRDTypes unexpected error: %v", err)
 	}
 	// May return empty or a small set of built-in resources; either is fine.
 	// What matters is no panic and no error.
@@ -361,43 +360,45 @@ func TestDiscoverCRDTypes_ReturnsEmpty_NoExtraCRDs(t *testing.T) {
 
 func TestDiscoverCRDTypes_ExcludesSystemGroups(t *testing.T) {
 	c := newTestClients()
-	result, err := discoverCRDTypes(c)
+	result, err := backupctl.DiscoverCRDTypes(c)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// None of the returned GVRs should be from a system group.
+	sysGroups := backupctl.SystemGroups()
 	for _, gvr := range result {
-		if systemGroups[gvr.Group] {
-			t.Errorf("discoverCRDTypes returned system group resource: %v", gvr)
+		if sysGroups[gvr.Group] {
+			t.Errorf("DiscoverCRDTypes returned system group resource: %v", gvr)
 		}
 	}
 }
 
 func TestDiscoverCRDTypes_ExcludesCoreTypes(t *testing.T) {
 	c := newTestClients()
-	result, err := discoverCRDTypes(c)
+	result, err := backupctl.DiscoverCRDTypes(c)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// None of the returned GVRs should duplicate coreResourceTypes.
-	coreSet := make(map[schema.GroupVersionResource]bool, len(coreResourceTypes))
-	for _, gvr := range coreResourceTypes {
+	// None of the returned GVRs should duplicate CoreResourceTypes.
+	coreTypes := backupctl.CoreResourceTypes()
+	coreSet := make(map[schema.GroupVersionResource]bool, len(coreTypes))
+	for _, gvr := range coreTypes {
 		coreSet[gvr] = true
 	}
 	for _, gvr := range result {
 		if coreSet[gvr] {
-			t.Errorf("discoverCRDTypes returned a core type that should be excluded: %v", gvr)
+			t.Errorf("DiscoverCRDTypes returned a core type that should be excluded: %v", gvr)
 		}
 	}
 }
 
 // -----------------------------------------------------------------------
-// backupExpired() — TTL enforcement
+// IsExpired() — TTL enforcement
 // -----------------------------------------------------------------------
 
 func TestBackupExpired_NoTTL(t *testing.T) {
-	b := &Backup{Spec: BackupSpec{TTL: ""}}
-	expired, err := backupExpired(b)
+	b := &types.Backup{Spec: types.BackupSpec{TTL: ""}}
+	expired, err := backupctl.IsExpired(b)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -407,9 +408,9 @@ func TestBackupExpired_NoTTL(t *testing.T) {
 }
 
 func TestBackupExpired_NoCompletedAt(t *testing.T) {
-	b := &Backup{Spec: BackupSpec{TTL: "1h"}}
+	b := &types.Backup{Spec: types.BackupSpec{TTL: "1h"}}
 	// CompletedAt is nil — backup has not finished yet.
-	expired, err := backupExpired(b)
+	expired, err := backupctl.IsExpired(b)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -420,11 +421,11 @@ func TestBackupExpired_NoCompletedAt(t *testing.T) {
 
 func TestBackupExpired_NotYetExpired(t *testing.T) {
 	completedAt := metav1.NewTime(time.Now().Add(-30 * time.Minute))
-	b := &Backup{
-		Spec:   BackupSpec{TTL: "2h"},
-		Status: BackupStatus{CompletedAt: &completedAt},
+	b := &types.Backup{
+		Spec:   types.BackupSpec{TTL: "2h"},
+		Status: types.BackupStatus{CompletedAt: &completedAt},
 	}
-	expired, err := backupExpired(b)
+	expired, err := backupctl.IsExpired(b)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -435,11 +436,11 @@ func TestBackupExpired_NotYetExpired(t *testing.T) {
 
 func TestBackupExpired_Expired(t *testing.T) {
 	completedAt := metav1.NewTime(time.Now().Add(-3 * time.Hour))
-	b := &Backup{
-		Spec:   BackupSpec{TTL: "1h"},
-		Status: BackupStatus{CompletedAt: &completedAt},
+	b := &types.Backup{
+		Spec:   types.BackupSpec{TTL: "1h"},
+		Status: types.BackupStatus{CompletedAt: &completedAt},
 	}
-	expired, err := backupExpired(b)
+	expired, err := backupctl.IsExpired(b)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -450,18 +451,18 @@ func TestBackupExpired_Expired(t *testing.T) {
 
 func TestBackupExpired_InvalidTTL(t *testing.T) {
 	completedAt := metav1.NewTime(time.Now())
-	b := &Backup{
-		Spec:   BackupSpec{TTL: "not-a-duration"},
-		Status: BackupStatus{CompletedAt: &completedAt},
+	b := &types.Backup{
+		Spec:   types.BackupSpec{TTL: "not-a-duration"},
+		Status: types.BackupStatus{CompletedAt: &completedAt},
 	}
-	_, err := backupExpired(b)
+	_, err := backupctl.IsExpired(b)
 	if err == nil {
 		t.Error("expected error for invalid TTL string")
 	}
 }
 
 // -----------------------------------------------------------------------
-// deleteExpiredBackup() — removes PVC data and CR
+// DeleteExpired() — removes PVC data and CR
 // -----------------------------------------------------------------------
 
 func TestDeleteExpiredBackup_RemovesDataAndCR(t *testing.T) {
@@ -481,10 +482,10 @@ func TestDeleteExpiredBackup_RemovesDataAndCR(t *testing.T) {
 	backupObj := makeBackupUnstructured("expired-backup", "my-ns", "Completed")
 	c := newTestClients(backupObj)
 
-	b := &Backup{
+	b := &types.Backup{
 		ObjectMeta: metav1.ObjectMeta{Name: "expired-backup"},
-		Spec:       BackupSpec{TTL: "1h"},
-		Status: BackupStatus{
+		Spec:       types.BackupSpec{TTL: "1h"},
+		Status: types.BackupStatus{
 			Phase:       "Completed",
 			StoragePath: backupDataPath,
 			CompletedAt: &completedAt,
@@ -492,8 +493,8 @@ func TestDeleteExpiredBackup_RemovesDataAndCR(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := deleteExpiredBackup(ctx, c, backupGVR, b); err != nil {
-		t.Fatalf("deleteExpiredBackup error: %v", err)
+	if err := backupctl.DeleteExpired(ctx, c, b); err != nil {
+		t.Fatalf("DeleteExpired error: %v", err)
 	}
 
 	// Storage path should be gone.
@@ -502,7 +503,7 @@ func TestDeleteExpiredBackup_RemovesDataAndCR(t *testing.T) {
 	}
 
 	// The CR should be deleted from the fake client.
-	list, err := c.dynamic.Resource(backupGVR).List(ctx, metav1.ListOptions{})
+	list, err := c.Dynamic.Resource(backupctl.GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list backups: %v", err)
 	}
@@ -514,18 +515,18 @@ func TestDeleteExpiredBackup_RemovesDataAndCR(t *testing.T) {
 }
 
 func TestDeleteExpiredBackup_MissingStoragePath(t *testing.T) {
-	// When StoragePath is empty, deleteExpiredBackup should still delete the CR.
+	// When StoragePath is empty, DeleteExpired should still delete the CR.
 	backupObj := makeBackupUnstructured("no-path-backup", "my-ns", "Completed")
 	c := newTestClients(backupObj)
 
-	b := &Backup{
+	b := &types.Backup{
 		ObjectMeta: metav1.ObjectMeta{Name: "no-path-backup"},
-		Spec:       BackupSpec{TTL: "1h"},
-		Status:     BackupStatus{Phase: "Completed"},
+		Spec:       types.BackupSpec{TTL: "1h"},
+		Status:     types.BackupStatus{Phase: "Completed"},
 	}
 
 	ctx := context.Background()
-	if err := deleteExpiredBackup(ctx, c, backupGVR, b); err != nil {
-		t.Fatalf("deleteExpiredBackup error: %v", err)
+	if err := backupctl.DeleteExpired(ctx, c, b); err != nil {
+		t.Fatalf("DeleteExpired error: %v", err)
 	}
 }

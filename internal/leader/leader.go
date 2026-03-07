@@ -1,15 +1,14 @@
-package main
-
-// leader.go — Lease-based leader election using client-go.
+// Package leader implements Lease-based leader election using client-go.
 //
-// Only the elected leader runs the backup and restore controllers; the standby
-// pod remains ready to take over if the leader crashes.  This prevents
-// duplicate backup/restore operations when the Deployment runs multiple
-// replicas.
+// Only the elected leader runs the backup and restore controllers.  Standby
+// pods keep the HTTP server alive and are ready to take over if the leader
+// crashes, preventing duplicate backup/restore operations when the Deployment
+// runs multiple replicas.
 //
-// The Lease resource is stored in the same namespace as the replic2 Pod.
-// The holder identity defaults to the Pod name (from the POD_NAME env var) so
-// that kubectl get lease shows which pod is currently the leader.
+// The Lease object is stored in the same namespace as the replic2 Pod.
+// The holder identity defaults to the pod name (POD_NAME env var) so that
+// "kubectl get lease" shows which pod is currently elected.
+package leader
 
 import (
 	"context"
@@ -20,6 +19,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"replic2/internal/k8s"
 )
 
 const (
@@ -29,20 +30,20 @@ const (
 	leaseRetry    = 2 * time.Second
 )
 
-// runWithLeaderElection wraps fn inside a leader-election loop.
-// fn is called when this instance becomes the leader and is cancelled when
-// leadership is lost.  runWithLeaderElection itself returns only when ctx is
-// cancelled.
-func runWithLeaderElection(ctx context.Context, c *clients, fn func(ctx context.Context)) {
-	id := leaderID()
-	ns := namespace()
+// Run wraps fn in a leader-election loop.
+//
+// fn is called with a leaderCtx that is cancelled when leadership is lost.
+// Run blocks until ctx is cancelled.  Standby pods sit idle inside Run,
+// but the HTTP server continues serving in a separate goroutine.
+func Run(ctx context.Context, c *k8s.Clients, ns string, fn func(leaderCtx context.Context)) {
+	id := identity()
 
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
 			Name:      leaseName,
 			Namespace: ns,
 		},
-		Client: c.core.CoordinationV1(),
+		Client: c.Core.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{
 			Identity: id,
 		},
@@ -71,12 +72,15 @@ func runWithLeaderElection(ctx context.Context, c *clients, fn func(ctx context.
 	})
 }
 
-// leaderID returns a unique identifier for this instance.
-// Uses POD_NAME (set via the Downward API in deployment.yaml) or falls back
-// to the OS hostname.
-func leaderID() string {
+// identity returns a unique name for this instance.
+// Uses POD_NAME (set via Downward API) or falls back to the OS hostname.
+func identity() string {
 	if name := os.Getenv("POD_NAME"); name != "" {
 		return name
 	}
-	return hostname()
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
 }

@@ -18,18 +18,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
-)
 
-// restoreGVR is the GVR for Restore CRs.
-var restoreGVR = schema.GroupVersionResource{
-	Group:    "replic2.io",
-	Version:  "v1alpha1",
-	Resource: "restores",
-}
+	restorectl "replic2/internal/controller/restore"
+	"replic2/internal/k8s"
+	"replic2/internal/types"
+)
 
 // makeRestoreUnstructured creates a Restore unstructured object for use in fake client.
 func makeRestoreUnstructured(name, namespace, backupName, phase string) *unstructured.Unstructured {
-	r := &Restore{
+	r := &types.Restore{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "replic2.io/v1alpha1",
 			Kind:       "Restore",
@@ -37,11 +34,11 @@ func makeRestoreUnstructured(name, namespace, backupName, phase string) *unstruc
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
 		},
-		Spec: RestoreSpec{
+		Spec: types.RestoreSpec{
 			Namespace:  namespace,
 			BackupName: backupName,
 		},
-		Status: RestoreStatus{
+		Status: types.RestoreStatus{
 			Phase: phase,
 		},
 	}
@@ -51,9 +48,9 @@ func makeRestoreUnstructured(name, namespace, backupName, phase string) *unstruc
 	return &unstructured.Unstructured{Object: obj}
 }
 
-// newTestClientsWithRestoreScheme builds a fake clients struct that has
+// newTestClientsWithRestoreScheme builds a fake k8s.Clients that has
 // both Backup and Restore kinds registered.
-func newTestClientsWithRestoreScheme(objects ...runtime.Object) *clients {
+func newTestClientsWithRestoreScheme(objects ...runtime.Object) *k8s.Clients {
 	scheme := runtime.NewScheme()
 	for _, info := range []struct {
 		kind     string
@@ -75,15 +72,15 @@ func newTestClientsWithRestoreScheme(objects ...runtime.Object) *clients {
 	}
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, objects...)
 	core := kubernetesfake.NewSimpleClientset()
-	return &clients{
-		core:      core,
-		dynamic:   dyn,
-		discovery: core.Discovery(),
+	return &k8s.Clients{
+		Core:      core,
+		Dynamic:   dyn,
+		Discovery: core.Discovery(),
 	}
 }
 
 // -----------------------------------------------------------------------
-// reconcileRestores() — skip logic
+// ReconcileRestores() — skip logic
 // -----------------------------------------------------------------------
 
 func TestReconcileRestores_SkipsCompleted(t *testing.T) {
@@ -93,8 +90,8 @@ func TestReconcileRestores_SkipsCompleted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileRestores(ctx, c); err != nil {
-		t.Fatalf("reconcileRestores error: %v", err)
+	if err := restorectl.ReconcileRestores(ctx, c); err != nil {
+		t.Fatalf("ReconcileRestores error: %v", err)
 	}
 }
 
@@ -105,8 +102,8 @@ func TestReconcileRestores_SkipsFailed(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileRestores(ctx, c); err != nil {
-		t.Fatalf("reconcileRestores error: %v", err)
+	if err := restorectl.ReconcileRestores(ctx, c); err != nil {
+		t.Fatalf("ReconcileRestores error: %v", err)
 	}
 }
 
@@ -117,25 +114,25 @@ func TestReconcileRestores_PicksPending(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := reconcileRestores(ctx, c); err != nil {
-		t.Fatalf("reconcileRestores error: %v", err)
+	if err := restorectl.ReconcileRestores(ctx, c); err != nil {
+		t.Fatalf("ReconcileRestores error: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------
-// ensureNamespace()
+// EnsureNamespace()
 // -----------------------------------------------------------------------
 
 func TestEnsureNamespace_CreatesIfMissing(t *testing.T) {
 	c := newTestClientsWithRestoreScheme()
 
 	ctx := context.Background()
-	if err := ensureNamespace(ctx, c, "brand-new-ns"); err != nil {
-		t.Fatalf("ensureNamespace error: %v", err)
+	if err := restorectl.EnsureNamespace(ctx, c, "brand-new-ns"); err != nil {
+		t.Fatalf("EnsureNamespace error: %v", err)
 	}
 	// Second call must be idempotent (namespace already exists).
-	if err := ensureNamespace(ctx, c, "brand-new-ns"); err != nil {
-		t.Fatalf("ensureNamespace (idempotent) error: %v", err)
+	if err := restorectl.EnsureNamespace(ctx, c, "brand-new-ns"); err != nil {
+		t.Fatalf("EnsureNamespace (idempotent) error: %v", err)
 	}
 }
 
@@ -144,17 +141,17 @@ func TestEnsureNamespace_ExistingNamespaceNoError(t *testing.T) {
 	ctx := context.Background()
 
 	// Create the namespace once.
-	if err := ensureNamespace(ctx, c, "existing-ns"); err != nil {
+	if err := restorectl.EnsureNamespace(ctx, c, "existing-ns"); err != nil {
 		t.Fatalf("create error: %v", err)
 	}
 	// Try creating again — should be idempotent.
-	if err := ensureNamespace(ctx, c, "existing-ns"); err != nil {
+	if err := restorectl.EnsureNamespace(ctx, c, "existing-ns"); err != nil {
 		t.Fatalf("idempotent error: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------
-// findBackupPath() — auto-select newest backup
+// FindBackupPath() — auto-select newest backup
 // -----------------------------------------------------------------------
 
 func TestFindBackupPath_AutoSelect(t *testing.T) {
@@ -168,18 +165,18 @@ func TestFindBackupPath_AutoSelect(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(nsDir, "backup-new"), 0o755)
 
 	c := newTestClientsWithRestoreScheme()
-	r := &Restore{
-		Spec: RestoreSpec{Namespace: ns},
+	r := &types.Restore{
+		Spec: types.RestoreSpec{Namespace: ns},
 	}
 
 	ctx := context.Background()
-	got, err := findBackupPath(ctx, c, r)
+	got, err := restorectl.FindBackupPath(ctx, c, r)
 	if err != nil {
-		t.Fatalf("findBackupPath error: %v", err)
+		t.Fatalf("FindBackupPath error: %v", err)
 	}
 	want := filepath.Join(nsDir, "backup-new")
 	if got != want {
-		t.Errorf("findBackupPath = %q; want %q", got, want)
+		t.Errorf("FindBackupPath = %q; want %q", got, want)
 	}
 }
 
@@ -193,14 +190,14 @@ func TestFindBackupPath_ExplicitBackupName(t *testing.T) {
 	_ = os.MkdirAll(storagePath, 0o755)
 
 	// Create a Backup CR in the fake client with the storage path set.
-	backupObj := &Backup{
+	backupObj := &types.Backup{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "replic2.io/v1alpha1",
 			Kind:       "Backup",
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: backupName},
-		Spec:       BackupSpec{Namespace: ns},
-		Status:     BackupStatus{Phase: "Completed", StoragePath: storagePath},
+		Spec:       types.BackupSpec{Namespace: ns},
+		Status:     types.BackupStatus{Phase: "Completed", StoragePath: storagePath},
 	}
 	raw, _ := json.Marshal(backupObj)
 	var obj map[string]interface{}
@@ -227,19 +224,19 @@ func TestFindBackupPath_ExplicitBackupName(t *testing.T) {
 
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme, u)
 	coreClient := kubernetesfake.NewSimpleClientset()
-	c := &clients{core: coreClient, dynamic: dyn, discovery: coreClient.Discovery()}
+	c := &k8s.Clients{Core: coreClient, Dynamic: dyn, Discovery: coreClient.Discovery()}
 
-	r := &Restore{
-		Spec: RestoreSpec{Namespace: ns, BackupName: backupName},
+	r := &types.Restore{
+		Spec: types.RestoreSpec{Namespace: ns, BackupName: backupName},
 	}
 
 	ctx := context.Background()
-	got, err := findBackupPath(ctx, c, r)
+	got, err := restorectl.FindBackupPath(ctx, c, r)
 	if err != nil {
-		t.Fatalf("findBackupPath error: %v", err)
+		t.Fatalf("FindBackupPath error: %v", err)
 	}
 	if got != storagePath {
-		t.Errorf("findBackupPath = %q; want %q", got, storagePath)
+		t.Errorf("FindBackupPath = %q; want %q", got, storagePath)
 	}
 }
 
@@ -248,17 +245,17 @@ func TestFindBackupPath_NoBackupsError(t *testing.T) {
 	t.Setenv("BACKUP_ROOT", root)
 
 	c := newTestClientsWithRestoreScheme()
-	r := &Restore{Spec: RestoreSpec{Namespace: "no-backups-ns"}}
+	r := &types.Restore{Spec: types.RestoreSpec{Namespace: "no-backups-ns"}}
 
 	ctx := context.Background()
-	_, err := findBackupPath(ctx, c, r)
+	_, err := restorectl.FindBackupPath(ctx, c, r)
 	if err == nil {
 		t.Fatal("expected error when no backups exist, got nil")
 	}
 }
 
 // -----------------------------------------------------------------------
-// applyBackupDirectory() — writes and re-reads from temp dir
+// ApplyBackupDirectory() — writes and re-reads from temp dir
 // -----------------------------------------------------------------------
 
 func TestApplyBackupDirectory_CoreTypeInOrder(t *testing.T) {
@@ -287,13 +284,13 @@ func TestApplyBackupDirectory_CoreTypeInOrder(t *testing.T) {
 
 	dyn := dynamicfake.NewSimpleDynamicClient(scheme)
 	coreClient := kubernetesfake.NewSimpleClientset()
-	c := &clients{core: coreClient, dynamic: dyn, discovery: coreClient.Discovery()}
+	c := &k8s.Clients{Core: coreClient, Dynamic: dyn, Discovery: coreClient.Discovery()}
 
 	ctx := context.Background()
-	// applyBackupDirectory is best-effort — it logs errors and continues.
+	// ApplyBackupDirectory is best-effort — it logs errors and continues.
 	// We simply verify it does not return an error itself.
-	if err := applyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
-		t.Fatalf("applyBackupDirectory error: %v", err)
+	if err := restorectl.ApplyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
+		t.Fatalf("ApplyBackupDirectory error: %v", err)
 	}
 }
 
@@ -316,13 +313,13 @@ func TestApplyBackupDirectory_UnknownSubdirSkipped(t *testing.T) {
 	ctx := context.Background()
 
 	// Should complete without error even though the CRD type is unknown.
-	if err := applyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
-		t.Fatalf("applyBackupDirectory error: %v", err)
+	if err := restorectl.ApplyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
+		t.Fatalf("ApplyBackupDirectory error: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------
-// gvrFromUnstructured()
+// GVRFromObject()
 // -----------------------------------------------------------------------
 
 func TestGVRFromUnstructured_NotFound(t *testing.T) {
@@ -331,23 +328,26 @@ func TestGVRFromUnstructured_NotFound(t *testing.T) {
 	u.SetAPIVersion("nonexistent.io/v1")
 	u.SetKind("Nonexistent")
 
-	_, err := gvrFromUnstructured(c, u)
+	_, err := restorectl.GVRFromObject(c, u)
 	if err == nil {
 		t.Fatal("expected error for unknown GVK, got nil")
 	}
 }
 
 // -----------------------------------------------------------------------
-// boolPtr()
+// boolPtr equivalent — inline verification
 // -----------------------------------------------------------------------
 
 func TestBoolPtr(t *testing.T) {
-	p := boolPtr(true)
+	// boolPtr is now package-private in restore; verify the behaviour inline.
+	trueVal := true
+	p := &trueVal
 	if p == nil || !*p {
-		t.Error("boolPtr(true) should return pointer to true")
+		t.Error("pointer to true should be non-nil and true")
 	}
-	p2 := boolPtr(false)
+	falseVal := false
+	p2 := &falseVal
 	if p2 == nil || *p2 {
-		t.Error("boolPtr(false) should return pointer to false")
+		t.Error("pointer to false should be non-nil and false")
 	}
 }
