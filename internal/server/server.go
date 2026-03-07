@@ -73,16 +73,16 @@ func backupHandler(c *gin.Context, clients *k8s.Clients) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	result := make([]backupResponse, 0, len(list.Items))
 	for _, item := range list.Items {
 		// Strip fields that must not be re-applied verbatim.
-		c.JSON(http.StatusOK, backupResponse{
+		result = append(result, backupResponse{
 			Name:        item.Object["metadata"].(map[string]interface{})["name"].(string),
 			Phase:       item.Object["status"].(map[string]interface{})["phase"].(string),
 			CompletedAt: item.Object["status"].(map[string]interface{})["completedAt"].(string),
 		})
-
 	}
-	c.JSON(http.StatusOK, list)
+	c.JSON(http.StatusOK, result)
 }
 
 // helloHandler handles GET / — returns app metadata.
