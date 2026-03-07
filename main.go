@@ -52,7 +52,7 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf(":%s", port),
-		Handler: server.NewRouter(clients),
+		Handler: server.NewRouter(clients, time.Now()),
 	}
 
 	go func() {

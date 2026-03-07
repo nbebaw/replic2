@@ -20,6 +20,7 @@ import (
 
 	"replic2/internal/k8s"
 	"replic2/internal/server"
+	"replic2/internal/server/handler"
 )
 
 func init() {
@@ -44,7 +45,7 @@ func newFakeClients(objects ...runtime.Object) *k8s.Clients {
 // -----------------------------------------------------------------------
 
 func TestHelloHandler_StatusOK(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -55,7 +56,7 @@ func TestHelloHandler_StatusOK(t *testing.T) {
 }
 
 func TestHelloHandler_ContentTypeJSON(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -67,12 +68,12 @@ func TestHelloHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestHelloHandler_BodyFields(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
-	var resp server.HelloResponse
+	var resp handler.HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -95,12 +96,12 @@ func TestHelloHandler_BodyFields(t *testing.T) {
 
 func TestHelloHandler_VersionFromEnv(t *testing.T) {
 	t.Setenv("APP_VERSION", "9.9.9")
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
-	var resp server.HelloResponse
+	var resp handler.HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -111,12 +112,12 @@ func TestHelloHandler_VersionFromEnv(t *testing.T) {
 
 func TestHelloHandler_NamespaceFromEnv(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "production")
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
-	var resp server.HelloResponse
+	var resp handler.HelloResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -130,7 +131,7 @@ func TestHelloHandler_NamespaceFromEnv(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestHealthzHandler_StatusOK(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -141,7 +142,7 @@ func TestHealthzHandler_StatusOK(t *testing.T) {
 }
 
 func TestHealthzHandler_ContentTypeJSON(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -153,12 +154,12 @@ func TestHealthzHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestHealthzHandler_BodyFields(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
-	var resp server.HealthResponse
+	var resp handler.HealthResponse
 	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
@@ -178,7 +179,7 @@ func TestHealthzHandler_BodyFields(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestReadyzHandler_StatusOK(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -189,7 +190,7 @@ func TestReadyzHandler_StatusOK(t *testing.T) {
 }
 
 func TestReadyzHandler_ContentTypeJSON(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
@@ -201,7 +202,7 @@ func TestReadyzHandler_ContentTypeJSON(t *testing.T) {
 }
 
 func TestReadyzHandler_BodyReady(t *testing.T) {
-	r := server.NewRouter(newFakeClients())
+	r := server.NewRouter(newFakeClients(), time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)

@@ -14,114 +14,46 @@ import (
 	"net/http"
 	"os"
 	"replic2/internal/k8s"
+	"replic2/internal/server/handler"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 )
-
-var startTime = time.Now()
-
-// HealthResponse is the JSON body returned by GET /healthz.
-type HealthResponse struct {
-	Status   string `json:"status"`
-	Uptime   string `json:"uptime"`
-	Hostname string `json:"hostname"`
-}
-
-// HelloResponse is the JSON body returned by GET /.
-type HelloResponse struct {
-	Message   string `json:"message"`
-	App       string `json:"app"`
-	Version   string `json:"version"`
-	Hostname  string `json:"hostname"`
-	Namespace string `json:"namespace"`
-	Timestamp string `json:"timestamp"`
-}
-
-type backupResponse struct {
-	Name        string `json:"name"`
-	Phase       string `json:"phase"`
-	CompletedAt string `json:"completedAt,omitempty"`
-}
-
-// GVR is the GroupVersionResource for the Backup CRD.
-var BackupGVR = schema.GroupVersionResource{
-	Group:    "replic2.io",
-	Version:  "v1alpha1",
-	Resource: "backups",
-}
 
 // NewRouter builds and returns a configured gin.Engine.
 // Extracted so tests can create the router without starting a real server.
-func NewRouter(clients *k8s.Clients) *gin.Engine {
+func NewRouter(clients *k8s.Clients, startTime time.Time) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.GET("/", helloHandler)
-	r.GET("/healthz", healthzHandler)
-	r.GET("/readyz", readyzHandler)
+	r.GET("/healthz", func(c *gin.Context) {
+		handler.HealthzHandler(c, startTime)
+	})
+	r.GET("/readyz", handler.ReadyzHandler)
 	r.GET("/backup", func(c *gin.Context) {
-		backupHandler(c, clients)
+		handler.BackupHandler(c, clients)
+	})
+	r.GET("/restore", func(c *gin.Context) {
+		handler.RestoreHandler(c, clients)
 	})
 	return r
 }
 
-func backupHandler(c *gin.Context, clients *k8s.Clients) {
-	list, err := clients.Dynamic.Resource(BackupGVR).List(c, metav1.ListOptions{})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	result := make([]backupResponse, 0, len(list.Items))
-	for _, item := range list.Items {
-		// Strip fields that must not be re-applied verbatim.
-		result = append(result, backupResponse{
-			Name:        item.Object["metadata"].(map[string]interface{})["name"].(string),
-			Phase:       item.Object["status"].(map[string]interface{})["phase"].(string),
-			CompletedAt: item.Object["status"].(map[string]interface{})["completedAt"].(string),
-		})
-	}
-	c.JSON(http.StatusOK, result)
-}
-
 // helloHandler handles GET / — returns app metadata.
 func helloHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, HelloResponse{
+	c.JSON(http.StatusOK, handler.HelloResponse{
 		Message:   "Hello from replic2!",
 		App:       "replic2",
 		Version:   appVersion(),
-		Hostname:  hostname(),
+		Hostname:  handler.Hostname(),
 		Namespace: podNamespace(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-// healthzHandler handles GET /healthz — liveness probe.
-func healthzHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, HealthResponse{
-		Status:   "ok",
-		Uptime:   time.Since(startTime).Round(time.Second).String(),
-		Hostname: hostname(),
-	})
-}
-
-// readyzHandler handles GET /readyz — readiness probe.
-func readyzHandler(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ready"})
-}
-
 // ---------------------------------------------------------------------------
 // Helpers — read from environment with sensible defaults.
 // ---------------------------------------------------------------------------
-
-func hostname() string {
-	h, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return h
-}
 
 func podNamespace() string {
 	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
