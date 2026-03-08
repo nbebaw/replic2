@@ -20,9 +20,9 @@
 //     already in the Succeeded phase, so the delete just removes a completed
 //     pod rather than killing a live one.
 //
-// For incremental backups, "--newer-mtime=<RFC3339>" is prepended to the tar
-// command so only files modified after the previous backup's completedAt are
-// included in the archive.
+// For incremental backups, "-N <date>" (BusyBox tar syntax) is prepended to
+// the tar command so only files modified after the previous backup's
+// completedAt are included in the archive.
 //
 // Archive naming:
 //   - Full:        <pvcDataDir>/<pvcName>.tar
@@ -102,10 +102,12 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	// Build the tar argv.  All output goes to stdout so the log API captures it.
 	tarCmd := []string{"tar", "-c", "-C", "/data", "."} // full: archive everything
 	if !sinceTime.IsZero() {
-		// GNU tar --newer-mtime accepts RFC3339 timestamps.
+		// BusyBox tar uses -N <date> for "newer than" filtering.
+		// --newer-mtime is a GNU tar extension not available in BusyBox.
+		// The date format must be "YYYY-MM-DD HH:MM:SS" (UTC).
 		tarCmd = []string{
 			"tar",
-			"--newer-mtime=" + sinceTime.UTC().Format(time.RFC3339), // mtime cut-off
+			"-N", sinceTime.UTC().Format("2006-01-02 15:04:05"), // mtime cut-off
 			"-c", "-C", "/data", ".", // archive only files newer than sinceTime
 		}
 	}
