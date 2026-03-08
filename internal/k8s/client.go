@@ -4,10 +4,11 @@
 // to the kubeconfig file for local development.
 //
 // The Clients struct is the single value passed to every controller and HTTP
-// handler that needs to talk to the API server.
+// handler that needs to talk to the API server or to S3.
 package k8s
 
 import (
+	"context" // for S3 client init
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,10 +21,12 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"replic2/internal/types"
+	s3store "replic2/internal/s3" // S3 client initialisation
+	"replic2/internal/types"      // CRD scheme registration
 )
 
-// Clients groups every Kubernetes client type used by replic2.
+// Clients groups every Kubernetes client type used by replic2, plus the S3
+// client used by the backup and restore controllers.
 type Clients struct {
 	// Core is the typed client for built-in Kubernetes resources
 	// (namespaces, leases, etc.).
@@ -43,10 +46,14 @@ type Clients struct {
 
 	// Codec decodes raw API-server JSON into our typed CRD objects.
 	Codec runtime.Codec
+
+	// S3 is the configured S3 client and bucket name.
+	// Backup manifests and PVC archives are stored in this bucket.
+	S3 *s3store.Config
 }
 
 // New builds a Clients instance from the ambient kubeconfig or in-cluster
-// service-account credentials.
+// service-account credentials, then initialises the S3 client.
 func New() (*Clients, error) {
 	cfg, err := loadRESTConfig()
 	if err != nil {
@@ -74,12 +81,20 @@ func New() (*Clients, error) {
 	}
 	codec := serializer.NewCodecFactory(scheme).LegacyCodec(types.SchemeGroupVersion)
 
+	// Initialise the S3 client from environment variables (S3_BUCKET,
+	// S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, …).
+	s3cfg, err := s3store.New(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("init S3 client: %w", err)
+	}
+
 	return &Clients{
 		Core:      core,
 		Dynamic:   dyn,
 		Discovery: disc,
 		REST:      cfg,
 		Codec:     codec,
+		S3:        s3cfg, // S3 client ready for backup/restore use
 	}, nil
 }
 

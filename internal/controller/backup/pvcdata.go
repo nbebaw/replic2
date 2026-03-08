@@ -5,38 +5,33 @@
 // source PVC may already be mounted on a different node).  Instead it:
 //
 //  1. Spawns a short-lived "agent" pod in the source namespace that mounts
-//     the source PVC read-only.  The pod's command IS the tar invocation,
-//     writing the archive to stdout.  No backup PVC is mounted in the agent
-//     pod — the backup PVC is only ever mounted by the replic2 controller.
+//     the source PVC read-only.  The pod's command tars the PVC contents and
+//     pipes the archive bytes directly to S3 using the AWS CLI.
+//     No backup PVC is involved at all.
 //
 //  2. Waits for the pod to reach Succeeded or Failed by polling its phase.
-//     The pod terminates itself as soon as tar exits — no exec, no SPDY, no
-//     force-kill needed.
+//     The pod terminates itself as soon as the AWS CLI exits.
 //
-//  3. Streams the pod's logs (tar's stdout) directly to an archive file on
-//     the backup PVC, which is already mounted in this process.
-//
-//  4. Deletes the pod via defer — by the time the defer runs the pod is
+//  3. Deletes the pod via defer — by the time the defer runs the pod is
 //     already in the Succeeded phase, so the delete just removes a completed
 //     pod rather than killing a live one.
 //
-// For incremental backups, "-N <date>" (BusyBox tar syntax) is prepended to
-// the tar command so only files modified after the previous backup's
-// completedAt are included in the archive.
+// S3 key layout:
 //
-// Archive naming:
-//   - Full:        <pvcDataDir>/<pvcName>.tar
-//   - Incremental: <pvcDataDir>/<pvcName>-incremental.tar
+//   - Full backup:        <keyPrefix>/pvc-data/<pvcName>.tar
+//   - Incremental backup: <keyPrefix>/pvc-data/<pvcName>-incremental.tar
+//
+// For incremental backups, a shell script uses `find -newer` to list only
+// files changed since the previous backup's completedAt timestamp, then pipes
+// that file list into tar via `-T`.
 package backup
 
 import (
-	"context"       // for cancellation / deadlines
-	"fmt"           // for error wrapping
-	"io"            // for io.Copy (stream logs to archive file)
-	"log"           // for structured logging
-	"os"            // for MkdirAll and Create (write archive to backup PVC)
-	"path/filepath" // for Join (build archive path)
-	"time"          // for sinceTime, agentPodTimeout, RFC3339 format
+	"context" // for cancellation / deadlines
+	"fmt"     // for error wrapping
+	"log"     // for structured logging
+	"os"      // for reading S3 env vars to pass to the agent pod
+	"time"    // for sinceTime, agentPodTimeout, RFC3339 format
 
 	corev1 "k8s.io/api/core/v1"                    // Pod, PVC types and phase constants
 	k8serrors "k8s.io/apimachinery/pkg/api/errors" // IsNotFound
@@ -49,10 +44,11 @@ import (
 // backupPVCData iterates over every PVC in namespace ns and calls
 // backupSinglePVC for each one that is in the Bound phase.
 //
+// keyPrefix is the S3 key prefix for this backup (e.g. "my-app/my-backup-01").
 // sinceTime controls incremental vs full:
 //   - zero value  → full backup (all files included)
 //   - non-zero    → incremental (only files with mtime > sinceTime)
-func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, storagePath string, sinceTime time.Time) error {
+func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, keyPrefix string, sinceTime time.Time) error {
 	// List all PVCs in the target namespace.
 	pvcList, err := c.Core.CoreV1().PersistentVolumeClaims(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -64,19 +60,13 @@ func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, 
 		return nil
 	}
 
-	// Create the pvc-data sub-directory inside this backup's storage path.
-	pvcDataDir := filepath.Join(storagePath, "pvc-data")
-	if err := os.MkdirAll(pvcDataDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir pvc-data: %w", err)
-	}
-
 	for _, pvc := range pvcList.Items {
 		// Only back up PVCs that are actively bound to a volume.
 		if pvc.Status.Phase != corev1.ClaimBound {
 			log.Printf("backup controller: [%s] PVC %q is not Bound (phase=%s) — skipping", b.Name, pvc.Name, pvc.Status.Phase)
 			continue
 		}
-		if err := backupSinglePVC(ctx, c, b, ns, pvcDataDir, pvc.Name, sinceTime); err != nil {
+		if err := backupSinglePVC(ctx, c, b, ns, keyPrefix, pvc.Name, sinceTime); err != nil {
 			// One failing PVC should not abort the rest — log and continue.
 			log.Printf("backup controller: [%s] PVC %q data backup error: %v", b.Name, pvc.Name, err)
 		}
@@ -84,40 +74,55 @@ func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, 
 	return nil
 }
 
-// backupSinglePVC spawns an agent pod whose command IS the tar invocation.
-// tar writes to stdout, which the Kubernetes log API captures.  Once the pod
-// reaches Succeeded the controller streams the pod logs to an archive file on
-// the backup PVC.  The pod is then deleted (it is already completed by that
-// point, so no force-kill occurs).
-func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, pvcDataDir, pvcName string, sinceTime time.Time) error {
+// backupSinglePVC spawns an agent pod that mounts the source PVC read-only and
+// runs a single command that tars the contents and pipes them directly to S3
+// via the AWS CLI (`tar ... | aws s3 cp - s3://...`).
+//
+// The pod exits as soon as the pipeline completes.  The controller polls until
+// the pod reaches Succeeded or Failed, then deletes it.
+func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, keyPrefix, pvcName string, sinceTime time.Time) error {
 	// -----------------------------------------------------------------------
-	// 1. Decide archive name and build the pod command.
-	//    tar writes the archive to stdout (no -f flag = stdout by default).
-	//    The pod command IS the tar/shell invocation — it exits when done.
+	// 1. Build the S3 destination key and the shell command.
+	//    The agent runs a single sh -c "..." invocation that:
+	//    a. Builds a tar archive of /data (full or incremental).
+	//    b. Pipes it directly to `aws s3 cp - s3://<bucket>/<key>`.
+	//    The bucket and credentials come from env vars on the pod.
 	// -----------------------------------------------------------------------
-	archiveName := pvcName + ".tar"                         // full backup
-	podCommand := []string{"tar", "-c", "-C", "/data", "."} // full: archive everything
+	bucket := os.Getenv("S3_BUCKET") // same bucket that the controller uses
 
+	archiveName := pvcName + ".tar" // full backup
 	if !sinceTime.IsZero() {
 		archiveName = pvcName + "-incremental.tar" // incremental backup
-
-		// BusyBox tar has no "newer than date" flag at all.
-		// Workaround: use a shell script that:
-		//   1. Touches a reference file with the exact cutoff timestamp (using
-		//      `touch -d` which BusyBox sh supports via the date built-in).
-		//   2. Uses `find -newer <ref>` to list all files modified after the
-		//      cutoff, writing them to a temp file list.
-		//   3. Feeds that file list to `tar -T` to build the archive.
-		// All output still goes to stdout so the log API captures the tar bytes.
-		ts := sinceTime.UTC().Format("2006-01-02 15:04:05") // BusyBox touch -d format
-		script := fmt.Sprintf(
-			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files`,
-			ts,
-		)
-		podCommand = []string{"sh", "-c", script}
 	}
 
-	archivePath := filepath.Join(pvcDataDir, archiveName) // destination on the backup PVC
+	// S3 destination key: <keyPrefix>/pvc-data/<pvcName>.tar
+	s3Key := fmt.Sprintf("%s/pvc-data/%s", keyPrefix, archiveName)
+	s3URI := fmt.Sprintf("s3://%s/%s", bucket, s3Key) // full s3:// URI for the AWS CLI
+
+	// Build the shell command.  For incremental backups we use find -newer to
+	// limit the archive to files modified after sinceTime.
+	var shellCmd string
+	if sinceTime.IsZero() {
+		// Full backup: archive everything under /data.
+		shellCmd = fmt.Sprintf(`tar -c -C /data . | aws s3 cp - '%s'`, s3URI)
+	} else {
+		// Incremental backup:
+		//   1. Create a reference file with the cutoff timestamp.
+		//   2. Find all files newer than the reference file.
+		//   3. Pipe that file list into tar, then upload to S3.
+		ts := sinceTime.UTC().Format("2006-01-02 15:04:05") // touch -d format
+		shellCmd = fmt.Sprintf(
+			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files | aws s3 cp - '%s'`,
+			ts, s3URI,
+		)
+	}
+
+	// Optionally append --endpoint-url for MinIO / non-AWS S3 providers.
+	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
+		// Append the flag to the aws s3 cp command inside the pipeline.
+		// We replace the trailing s3URI with s3URI + --endpoint-url flag.
+		shellCmd += fmt.Sprintf(" --endpoint-url '%s'", endpoint)
+	}
 
 	// -----------------------------------------------------------------------
 	// 2. Build the pod name; truncate to the 63-char Kubernetes DNS label limit.
@@ -128,12 +133,25 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	}
 
 	// -----------------------------------------------------------------------
-	// 3. Define the agent pod.
+	// 3. Collect S3 env vars to inject into the agent pod.
+	//    The AWS CLI inside the pod reads credentials from standard env vars.
+	// -----------------------------------------------------------------------
+	agentEnv := []corev1.EnvVar{
+		// AWS credentials and region — standard AWS CLI env vars.
+		{Name: "AWS_ACCESS_KEY_ID", Value: os.Getenv("S3_ACCESS_KEY_ID")},
+		{Name: "AWS_SECRET_ACCESS_KEY", Value: os.Getenv("S3_SECRET_ACCESS_KEY")},
+		{Name: "AWS_DEFAULT_REGION", Value: os.Getenv("S3_REGION")},
+		// S3_BUCKET is needed only if the shell script computed s3URI incorrectly,
+		// but we keep it for completeness / debugging inside the pod.
+		{Name: "S3_BUCKET", Value: bucket},
+	}
+
+	// -----------------------------------------------------------------------
+	// 4. Define the agent pod.
+	//    - Uses the amazon/aws-cli image which bundles both tar and the AWS CLI.
 	//    - Mounts the source PVC read-only at /data.
-	//    - Full backup:        command is plain tar writing to stdout.
-	//    - Incremental backup: command is a sh script that uses find -newer
-	//      to build a file list, then pipes it to tar via -T.
-	//    - The backup PVC is never mounted here; data flows via the log stream.
+	//    - Runs a single sh -c command; exits when done.
+	//    - S3 credentials are passed via env vars — never written to disk.
 	// -----------------------------------------------------------------------
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -149,8 +167,9 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 			Containers: []corev1.Container{
 				{
 					Name:    "agent",
-					Image:   "busybox:stable", // provides sh, find, touch, tar
-					Command: podCommand,       // runs as PID 1; pod exits when command exits
+					Image:   "amazon/aws-cli",               // provides both aws CLI and a POSIX shell
+					Command: []string{"sh", "-c", shellCmd}, // runs as PID 1; exits when done
+					Env:     agentEnv,                       // S3 credentials
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "source-pvc",
@@ -177,7 +196,6 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 
 	// Delete any leftover pod from a previous (failed) attempt so Create succeeds,
 	// then wait until the API server confirms it is gone before creating a new one.
-	// Without the wait, Create can race with the terminating pod and return "already exists".
 	if err := deleteAndWaitForPodGone(ctx, c, ns, podName); err != nil {
 		return fmt.Errorf("cleanup stale agent pod %q: %w", podName, err)
 	}
@@ -188,16 +206,14 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	log.Printf("backup controller: [%s] agent pod %q created for PVC %q", b.Name, podName, pvcName)
 
 	// Always delete the pod when this function returns, regardless of outcome.
-	// In the success path the pod is already Succeeded at this point, so the
-	// delete just removes a completed pod cleanly.
 	defer func() {
 		_ = c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
 		log.Printf("backup controller: [%s] agent pod %q deleted", b.Name, podName)
 	}()
 
 	// -----------------------------------------------------------------------
-	// 4. Poll until the pod reaches a terminal phase (Succeeded or Failed).
-	//    The pod terminates itself as soon as tar exits — no force-kill needed.
+	// 5. Poll until the pod reaches a terminal phase (Succeeded or Failed).
+	//    The pod exits as soon as the tar | aws s3 cp pipeline completes.
 	// -----------------------------------------------------------------------
 	deadline := time.Now().Add(agentPodTimeout) // absolute deadline
 	for {
@@ -212,11 +228,12 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 
 		switch p.Status.Phase {
 		case corev1.PodSucceeded:
-			// tar finished successfully — proceed to stream logs below.
-			log.Printf("backup controller: [%s] agent pod %q succeeded", b.Name, podName)
+			// Pipeline finished successfully — archive is in S3.
+			log.Printf("backup controller: [%s] agent pod %q succeeded — PVC %q archived to %s", b.Name, podName, pvcName, s3URI)
+			return nil // success path
 		case corev1.PodFailed:
-			// tar exited non-zero — surface the error.
-			return fmt.Errorf("agent pod %q failed (check pod logs for tar error)", podName)
+			// aws s3 cp or tar exited non-zero.
+			return fmt.Errorf("agent pod %q failed — check pod logs for error", podName)
 		default:
 			// Still Pending or Running — wait and poll again.
 			select {
@@ -224,39 +241,8 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 				return ctx.Err()
 			case <-time.After(5 * time.Second): // poll interval
 			}
-			continue // go back to the top of the loop
 		}
-		break // only reached on PodSucceeded
 	}
-
-	// -----------------------------------------------------------------------
-	// 5. Stream the pod logs (tar's stdout) into the archive file on the
-	//    backup PVC.  The pod has already exited so the log stream is complete
-	//    and will not block.
-	// -----------------------------------------------------------------------
-	logStream, err := c.Core.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{
-		Container: "agent", // the container whose stdout we want
-	}).Stream(ctx)
-	if err != nil {
-		return fmt.Errorf("get logs for pod %q: %w", podName, err)
-	}
-	defer logStream.Close()
-
-	// Open (or create) the destination archive file on the backup PVC.
-	archiveFile, err := os.Create(archivePath)
-	if err != nil {
-		return fmt.Errorf("create archive file %q: %w", archivePath, err)
-	}
-	defer archiveFile.Close()
-
-	// Copy the log stream (tar bytes) directly into the archive file.
-	written, err := io.Copy(archiveFile, logStream)
-	if err != nil {
-		return fmt.Errorf("stream logs to archive %q: %w", archivePath, err)
-	}
-
-	log.Printf("backup controller: [%s] archived PVC %q → %s (%d bytes)", b.Name, pvcName, archivePath, written)
-	return nil
 }
 
 // deleteAndWaitForPodGone deletes the named pod (ignoring "not found") and then

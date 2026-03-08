@@ -1,42 +1,42 @@
 // manifests.go — Kubernetes manifest serialisation helpers.
 //
-// This file is responsible for dumping each resource type to YAML files on the
-// backup PVC, and for discovering additional CRD types via the API discovery
-// client so that third-party operators (cert-manager, Prometheus, Argo CD, …)
-// are included automatically.
+// This file is responsible for serialising each resource type to YAML and
+// uploading it to S3, and for discovering additional CRD types via the API
+// discovery client so that third-party operators (cert-manager, Prometheus,
+// Argo CD, …) are included automatically.
+//
+// S3 key layout:
+//
+//	<keyPrefix>/<resource>/<name>.yaml
+//
+// Example:
+//
+//	my-app/my-backup-01/deployments/web.yaml
 package backup
 
 import (
-	"context"       // for cancellation / deadlines
-	"fmt"           // for error wrapping
-	"log"           // for structured logging
-	"os"            // for MkdirAll / WriteFile
-	"path/filepath" // for Join (build per-resource directory path)
-	"strings"       // for Contains (skip sub-resources like "pods/log")
+	"context" // for cancellation / deadlines
+	"fmt"     // for error wrapping
+	"log"     // for structured logging
+	"strings" // for Contains (skip sub-resources like "pods/log")
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // ListOptions, Verbs
 	"k8s.io/apimachinery/pkg/runtime/schema"      // GroupVersionResource, ParseGroupVersion
 
 	"replic2/internal/k8s"   // Kubernetes client wrapper
-	"replic2/internal/store" // JSONToYAML — converts raw JSON to YAML bytes
+	"replic2/internal/store" // JSONToYAML, PutObject — S3 upload helpers
 )
 
 // backupResourceType lists every resource of the given GVR in namespace ns and
-// writes one YAML file per object under storagePath/<resource>/<name>.yaml.
+// uploads one YAML object per resource instance to S3 under keyPrefix/<resource>/<name>.yaml.
 //
 // Fields that must not be re-applied verbatim (resourceVersion, uid, …) are
-// stripped before serialisation so that a restore can apply the files cleanly.
-func backupResourceType(ctx context.Context, c *k8s.Clients, ns, storagePath string, gvr schema.GroupVersionResource) error {
+// stripped before serialisation so that a restore can apply the objects cleanly.
+func backupResourceType(ctx context.Context, c *k8s.Clients, ns, keyPrefix string, gvr schema.GroupVersionResource) error {
 	// List all instances of this resource type in the target namespace.
 	list, err := c.Dynamic.Resource(gvr).Namespace(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return err // caller logs and continues — a missing API is non-fatal
-	}
-
-	// Create a sub-directory named after the resource (e.g. "deployments/").
-	dir := filepath.Join(storagePath, gvr.Resource)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %q: %w", dir, err)
 	}
 
 	for _, item := range list.Items {
@@ -55,18 +55,23 @@ func backupResourceType(ctx context.Context, c *k8s.Clients, ns, storagePath str
 			continue // skip this object, keep writing others
 		}
 
-		// Convert JSON → YAML for human-readability on the backup PVC.
+		// Convert JSON → YAML for human-readability in S3.
 		yamlBytes, err := store.JSONToYAML(raw)
 		if err != nil {
 			log.Printf("backup: json→yaml %s/%s: %v", gvr.Resource, item.GetName(), err)
 			continue // skip this object, keep writing others
 		}
 
-		// Write <storagePath>/<resource>/<name>.yaml
-		filename := filepath.Join(dir, item.GetName()+".yaml")
-		if err := os.WriteFile(filename, yamlBytes, 0o644); err != nil {
-			log.Printf("backup: write %s: %v", filename, err)
-			// Non-fatal: log and continue with the next object.
+		// Build the S3 key: <keyPrefix>/<resource>/<name>.yaml
+		key := fmt.Sprintf("%s/%s/%s.yaml", keyPrefix, gvr.Resource, item.GetName())
+
+		// Upload the YAML bytes directly to S3.
+		// Guard: if c.S3 is nil (e.g. unit tests with fake clients), skip the upload.
+		if c.S3 != nil {
+			if err := store.PutObject(ctx, c.S3, key, yamlBytes); err != nil {
+				log.Printf("backup: put s3 %s: %v", key, err)
+				// Non-fatal: log and continue with the next object.
+			}
 		}
 	}
 	return nil

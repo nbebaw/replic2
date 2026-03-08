@@ -7,7 +7,7 @@
 //   - patchStatus   — write status sub-object back to the API server
 //   - markFailed    — convenience: set phase=Failed and call patchStatus
 //   - isExpired     — check whether spec.ttl has elapsed since completedAt
-//   - deleteExpired — remove PVC data + the Backup CR itself
+//   - deleteExpired — remove S3 objects under the key prefix + the Backup CR
 //
 // The exported wrappers IsExpired and DeleteExpired are used by the scheduled
 // backup controller and by the test suite.
@@ -18,13 +18,13 @@ import (
 	"encoding/json" // to marshal the status struct to JSON for the patch body
 	"fmt"           // for error wrapping
 	"log"           // for structured logging
-	"os"            // for RemoveAll (delete PVC data on expiry)
 	"time"          // for ParseDuration and time.Now (TTL check)
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Now(), DeleteOptions, PatchOptions
 	"k8s.io/apimachinery/pkg/types"               // MergePatchType
 
 	"replic2/internal/k8s"            // Kubernetes client wrapper
+	"replic2/internal/store"          // DeletePrefix — S3 bulk delete helper
 	apitypes "replic2/internal/types" // Backup struct, phase constants
 )
 
@@ -100,17 +100,18 @@ func isExpired(b *apitypes.Backup) (bool, error) {
 // and by the test suite.
 func IsExpired(b *apitypes.Backup) (bool, error) { return isExpired(b) }
 
-// deleteExpired removes the PVC data directory and the Backup CR itself.
+// deleteExpired removes the S3 objects under the key prefix and the Backup CR.
 // It is called by reconcile() in a goroutine when isExpired returns true.
 func deleteExpired(ctx context.Context, c *k8s.Clients, b *apitypes.Backup) error {
 	log.Printf("backup controller: [%s] TTL expired — deleting", b.Name)
 
-	// 1. Remove data from the backup PVC (best-effort).
-	//    If the path does not exist (already cleaned up) that is fine.
-	if b.Status.StoragePath != "" {
-		if err := os.RemoveAll(b.Status.StoragePath); err != nil && !os.IsNotExist(err) {
-			log.Printf("backup controller: [%s] remove %q: %v", b.Name, b.Status.StoragePath, err)
-			// Non-fatal: continue to delete the CR even if filesystem removal fails.
+	// 1. Remove all S3 objects under the backup's key prefix (best-effort).
+	//    If c.S3 is nil (e.g. in unit tests with fake clients), skip S3 delete.
+	//    If StoragePath is empty the backup never wrote any data — skip silently.
+	if c.S3 != nil && b.Status.StoragePath != "" {
+		if err := store.DeletePrefix(ctx, c.S3, b.Status.StoragePath); err != nil {
+			// Non-fatal: log and continue to delete the CR even if S3 removal fails.
+			log.Printf("backup controller: [%s] delete S3 prefix %q: %v", b.Name, b.Status.StoragePath, err)
 		}
 	}
 

@@ -13,15 +13,12 @@ import (
 	"encoding/json" // to decode unstructured CR bytes from the dynamic client
 	"fmt"           // for error wrapping
 	"log"           // for structured logging
-	"os"            // for MkdirAll (create the backup directory)
-	"path/filepath" // for Join (build storage path)
 	"time"          // for sinceTime (incremental cut-off)
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // Now(), ListOptions
 	"k8s.io/apimachinery/pkg/runtime/schema"      // GroupVersionResource (allTypes)
 
 	"replic2/internal/k8s"            // Kubernetes client wrapper
-	"replic2/internal/store"          // BackupRoot() — the PVC mount path
 	apitypes "replic2/internal/types" // Backup struct, phase constants, type constants
 )
 
@@ -75,16 +72,15 @@ func process(ctx context.Context, c *k8s.Clients, b *apitypes.Backup) error {
 	}
 
 	// -----------------------------------------------------------------------
-	// 3. Create the storage directory on the backup PVC.
-	//    Path: <BACKUP_ROOT>/<namespace>/<backup-name>/
+	// 3. Build the S3 key prefix for this backup.
+	//    Format: <namespace>/<backup-name>
+	//    Example: my-app/my-backup-01
+	//    All manifests and PVC archives live under this prefix in the bucket.
 	// -----------------------------------------------------------------------
-	storagePath := filepath.Join(store.BackupRoot(), ns, b.Name)
-	if err := os.MkdirAll(storagePath, 0o755); err != nil {
-		return markFailed(ctx, c, b, fmt.Errorf("mkdir %q: %w", storagePath, err))
-	}
+	keyPrefix := ns + "/" + b.Name // S3 key prefix (replaces the old filesystem path)
 
 	// -----------------------------------------------------------------------
-	// 4. Manifest backup — serialise every resource to YAML.
+	// 4. Manifest backup — serialise every resource to YAML and upload to S3.
 	//    Start with the ordered coreResourceTypes, then append any CRDs found
 	//    via API discovery (cert-manager, Prometheus, Argo CD, Istio, …).
 	// -----------------------------------------------------------------------
@@ -99,7 +95,7 @@ func process(ctx context.Context, c *k8s.Clients, b *apitypes.Backup) error {
 	}
 
 	for _, gvr := range allTypes {
-		if err := backupResourceType(ctx, c, ns, storagePath, gvr); err != nil {
+		if err := backupResourceType(ctx, c, ns, keyPrefix, gvr); err != nil {
 			// A missing or unavailable API group should not abort the whole backup.
 			log.Printf("backup controller: [%s] skip %s: %v", b.Name, gvr.Resource, err)
 		}
@@ -115,7 +111,7 @@ func process(ctx context.Context, c *k8s.Clients, b *apitypes.Backup) error {
 		if backupType == apitypes.BackupTypeIncremental && prev != nil && prev.Status.CompletedAt != nil {
 			sinceTime = prev.Status.CompletedAt.Time // use previous backup's completion time
 		}
-		if err := backupPVCData(ctx, c, b, ns, storagePath, sinceTime); err != nil {
+		if err := backupPVCData(ctx, c, b, ns, keyPrefix, sinceTime); err != nil {
 			return markFailed(ctx, c, b, fmt.Errorf("PVC data backup: %w", err))
 		}
 	}
@@ -126,13 +122,13 @@ func process(ctx context.Context, c *k8s.Clients, b *apitypes.Backup) error {
 	done := metav1.Now() // capture the end timestamp
 	b.Status.Phase = apitypes.PhaseCompleted
 	b.Status.CompletedAt = &done
-	b.Status.StoragePath = storagePath // record where the data lives
+	b.Status.StoragePath = keyPrefix // S3 key prefix where all data lives
 	b.Status.Message = fmt.Sprintf("%s backup complete — %d resource types captured", backupType, len(allTypes))
 	if err := patchStatus(ctx, c, b); err != nil {
 		return fmt.Errorf("set Completed: %w", err)
 	}
 
-	log.Printf("backup controller: [%s] done — path: %s", b.Name, storagePath)
+	log.Printf("backup controller: [%s] done — s3 key prefix: %s", b.Name, keyPrefix)
 	return nil
 }
 

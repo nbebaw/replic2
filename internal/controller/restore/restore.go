@@ -4,45 +4,42 @@
 // When a new CR appears with phase "" or "Pending" it:
 //
 //  1. Sets phase → InProgress.
-//  2. Locates the backup directory on the PVC:
+//  2. Locates the backup S3 key prefix:
 //     a. If spec.backupName is set, reads the Backup CR for its StoragePath.
-//     b. Otherwise, selects the newest sub-directory under
-//     <BACKUP_ROOT>/<namespace>/ by mtime.
+//     b. Otherwise, lists all Backup CRs for the namespace and picks the most
+//     recently completed one.
 //  3. Ensures the target namespace exists (creates it when missing).
-//  4. Applies every .yaml file in the backup directory to the cluster using
-//     Server-Side Apply; falls back to Create when SSA is unavailable.
+//  4. Applies every manifest stored under <keyPrefix>/ in S3 to the cluster
+//     using Server-Side Apply; falls back to Create when SSA is unavailable.
 //  5. Sets phase → Completed (or Failed on error).
 package restore
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-	"time"
+	"context"       // for cancellation / deadlines
+	"encoding/json" // to decode unstructured CR bytes from the dynamic client
+	"fmt"           // for error wrapping
+	"log"           // for structured logging
+	"strings"       // for Contains (skip sub-resources like "pods/log")
+	"time"          // for the poll ticker
 
-	corev1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
+	corev1 "k8s.io/api/core/v1"                         // Namespace type
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"      // IsNotFound, IsAlreadyExists
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"       // Now(), ListOptions, GetOptions
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured" // Unstructured (dynamic objects)
+	"k8s.io/apimachinery/pkg/runtime/schema"            // GroupVersionResource
+	"k8s.io/apimachinery/pkg/types"                     // ApplyPatchType, MergePatchType
 
-	"replic2/internal/controller/backup"
-	"replic2/internal/k8s"
-	"replic2/internal/store"
-	apitypes "replic2/internal/types"
+	"replic2/internal/controller/backup" // GVR (Backup), CoreResourceTypes
+	"replic2/internal/k8s"               // Kubernetes client wrapper
+	"replic2/internal/store"             // GetObject, ListKeys, DecodeYAML
+	apitypes "replic2/internal/types"    // Restore struct, phase constants
 )
 
 // GVR is the GroupVersionResource for the Restore CRD.
 var GVR = schema.GroupVersionResource{
-	Group:    "replic2.io",
-	Version:  "v1alpha1",
-	Resource: "restores",
+	Group:    "replic2.io", // our custom API group
+	Version:  "v1alpha1",   // CRD version
+	Resource: "restores",   // plural resource name
 }
 
 // Run polls for Restore CRs every 5 seconds until ctx is cancelled.
@@ -50,10 +47,10 @@ func Run(ctx context.Context, c *k8s.Clients) {
 	log.Println("restore controller: started")
 	for {
 		select {
-		case <-ctx.Done():
+		case <-ctx.Done(): // context cancelled — shut down cleanly
 			log.Println("restore controller: stopped")
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(5 * time.Second): // wait before each reconcile pass
 			if err := reconcile(ctx, c); err != nil {
 				log.Printf("restore controller: reconcile error: %v", err)
 			}
@@ -63,28 +60,32 @@ func Run(ctx context.Context, c *k8s.Clients) {
 
 // reconcile lists all Restore CRs and processes any that are pending.
 func reconcile(ctx context.Context, c *k8s.Clients) error {
+	// Fetch all Restore CRs cluster-wide using the dynamic client.
 	list, err := c.Dynamic.Resource(GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("list restores: %w", err)
 	}
 
 	for _, item := range list.Items {
+		// Marshal the unstructured item to JSON so we can decode it into our typed struct.
 		raw, err := item.MarshalJSON()
 		if err != nil {
 			log.Printf("restore controller: marshal item: %v", err)
-			continue
+			continue // skip items we cannot read
 		}
 
 		var r apitypes.Restore
 		if err := json.Unmarshal(raw, &r); err != nil {
 			log.Printf("restore controller: decode restore: %v", err)
-			continue
+			continue // skip malformed CRs
 		}
 
+		// Only process restores that have not started yet.
 		if r.Status.Phase != "" && r.Status.Phase != apitypes.PhasePending {
-			continue
+			continue // already InProgress, Completed, or Failed — leave it alone
 		}
 
+		// Spawn one goroutine per CR so slow restores do not block the poll loop.
 		go func(r apitypes.Restore) {
 			if err := process(ctx, c, &r); err != nil {
 				log.Printf("restore controller: [%s] failed: %v", r.Name, err)
@@ -96,10 +97,10 @@ func reconcile(ctx context.Context, c *k8s.Clients) error {
 
 // process runs the full restore workflow for one Restore CR.
 func process(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) error {
-	ns := r.Spec.Namespace
+	ns := r.Spec.Namespace // target namespace to restore into
 	log.Printf("restore controller: [%s] restoring namespace %q", r.Name, ns)
 
-	// Phase: InProgress
+	// Phase: InProgress — mark the restore as started before doing any work.
 	now := metav1.Now()
 	r.Status.Phase = apitypes.PhaseInProgress
 	r.Status.StartedAt = &now
@@ -108,200 +109,231 @@ func process(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) error {
 		return fmt.Errorf("set InProgress: %w", err)
 	}
 
-	backupPath, err := findBackupPath(ctx, c, r)
+	// Locate the S3 key prefix that contains the backup manifests.
+	keyPrefix, err := findBackupPath(ctx, c, r)
 	if err != nil {
 		return markFailed(ctx, c, r, fmt.Errorf("locate backup: %w", err))
 	}
 
+	// Recreate the namespace if it does not already exist.
 	if err := ensureNamespace(ctx, c, ns); err != nil {
 		return markFailed(ctx, c, r, fmt.Errorf("ensure namespace: %w", err))
 	}
 
-	if err := applyBackupDirectory(ctx, c, backupPath, ns); err != nil {
+	// Apply all manifests stored under keyPrefix in S3.
+	if err := applyBackupDirectory(ctx, c, keyPrefix, ns); err != nil {
 		return markFailed(ctx, c, r, fmt.Errorf("apply resources: %w", err))
 	}
 
-	// Phase: Completed
+	// Phase: Completed.
 	done := metav1.Now()
 	r.Status.Phase = apitypes.PhaseCompleted
 	r.Status.CompletedAt = &done
-	r.Status.RestoredFrom = backupPath
+	r.Status.RestoredFrom = keyPrefix // record the S3 key prefix used
 	r.Status.Message = "restore complete"
 	if err := patchStatus(ctx, c, r); err != nil {
 		return fmt.Errorf("set Completed: %w", err)
 	}
 
-	log.Printf("restore controller: [%s] done — restored from: %s", r.Name, backupPath)
+	log.Printf("restore controller: [%s] done — restored from s3 prefix: %s", r.Name, keyPrefix)
 	return nil
 }
 
-// findBackupPath returns the PVC directory to restore from.
+// findBackupPath returns the S3 key prefix to restore from.
 //
 // If spec.backupName is set, the controller fetches that Backup CR and uses
-// its StoragePath.  Otherwise it picks the newest sub-directory under
-// <BACKUP_ROOT>/<namespace>/ by modification time.
+// its StoragePath field (which holds the S3 key prefix).  Otherwise it scans
+// all Backup CRs for the namespace and picks the most recently completed one.
 func findBackupPath(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) (string, error) {
-	ns := r.Spec.Namespace
+	ns := r.Spec.Namespace // namespace we are looking for backups of
 
 	if r.Spec.BackupName != "" {
+		// Explicit backup name — look it up directly.
 		item, err := c.Dynamic.Resource(backup.GVR).Get(ctx, r.Spec.BackupName, metav1.GetOptions{})
 		if err != nil {
 			return "", fmt.Errorf("get Backup %q: %w", r.Spec.BackupName, err)
 		}
-		raw, _ := item.MarshalJSON()
+		raw, _ := item.MarshalJSON() // convert unstructured to JSON
 		var b apitypes.Backup
 		if err := json.Unmarshal(raw, &b); err != nil {
 			return "", fmt.Errorf("decode Backup: %w", err)
 		}
 		if b.Status.StoragePath == "" {
+			// The backup has no storage path — it either failed or is still running.
 			return "", fmt.Errorf("Backup %q has no storage path (phase: %s)", r.Spec.BackupName, b.Status.Phase)
 		}
-		if _, err := os.Stat(b.Status.StoragePath); err != nil {
-			return "", fmt.Errorf("storage path %q not found on PVC: %w", b.Status.StoragePath, err)
-		}
-		return b.Status.StoragePath, nil
+		return b.Status.StoragePath, nil // return the S3 key prefix from the Backup status
 	}
 
-	// Auto-select: newest sub-directory under <root>/<namespace>/.
-	nsDir := filepath.Join(store.BackupRoot(), ns)
-	entries, err := os.ReadDir(nsDir)
+	// Auto-select: find the most recently completed Backup CR for this namespace.
+	list, err := c.Dynamic.Resource(backup.GVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return "", fmt.Errorf("no backups found for namespace %q (dir %q): %w", ns, nsDir, err)
+		return "", fmt.Errorf("list backups: %w", err)
 	}
 
-	type dirEntry struct {
-		name    string
-		modTime time.Time
-	}
-	var dirs []dirEntry
-	for _, e := range entries {
-		if !e.IsDir() {
+	var latestBackup *apitypes.Backup // track the newest completed backup
+	for _, item := range list.Items {
+		raw, _ := item.MarshalJSON() // convert unstructured item to JSON
+		var b apitypes.Backup
+		if err := json.Unmarshal(raw, &b); err != nil {
+			log.Printf("restore controller: decode backup item: %v", err)
+			continue // skip malformed CRs
+		}
+
+		// Only consider completed backups for our target namespace with a valid storage path.
+		if b.Spec.Namespace != ns || b.Status.Phase != apitypes.PhaseCompleted || b.Status.StoragePath == "" {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
+		// Guard: a completed backup without a CompletedAt timestamp is invalid.
+		if b.Status.CompletedAt == nil {
 			continue
 		}
-		dirs = append(dirs, dirEntry{name: e.Name(), modTime: info.ModTime()})
+
+		bCopy := b // capture a copy to avoid loop-variable aliasing
+		if latestBackup == nil || bCopy.Status.CompletedAt.After(latestBackup.Status.CompletedAt.Time) {
+			latestBackup = &bCopy // this is the most recent completed backup so far
+		}
 	}
-	if len(dirs) == 0 {
-		return "", fmt.Errorf("no backup directories found under %q", nsDir)
+
+	if latestBackup == nil {
+		return "", fmt.Errorf("no completed backups found for namespace %q", ns)
 	}
-	// Sort newest first.
-	sort.Slice(dirs, func(i, j int) bool {
-		return dirs[i].modTime.After(dirs[j].modTime)
-	})
-	return filepath.Join(nsDir, dirs[0].name), nil
+	return latestBackup.Status.StoragePath, nil // S3 key prefix of the latest backup
 }
 
 // ensureNamespace creates the namespace if it does not already exist.
 func ensureNamespace(ctx context.Context, c *k8s.Clients, ns string) error {
 	_, err := c.Core.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
 	if err == nil {
-		return nil // already exists
+		return nil // namespace already exists — nothing to do
 	}
 	if !k8serrors.IsNotFound(err) {
-		return fmt.Errorf("get namespace: %w", err)
+		return fmt.Errorf("get namespace: %w", err) // unexpected error
 	}
 
+	// Namespace is missing — create it.
 	nsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: ns},
 	}
 	_, err = c.Core.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{})
 	if err != nil && !k8serrors.IsAlreadyExists(err) {
+		// IsAlreadyExists is safe to ignore — created by a concurrent goroutine.
 		return fmt.Errorf("create namespace: %w", err)
 	}
 	log.Printf("restore: created namespace %q", ns)
 	return nil
 }
 
-// applyBackupDirectory walks backupPath and applies all .yaml files.
+// applyBackupDirectory enumerates all S3 manifest keys under keyPrefix and
+// applies them to the cluster.
 //
-// Pass 1 applies the hardcoded coreResourceTypes in dependency order.
-// Pass 2 applies any remaining sub-directories (third-party CRDs backed up
-// via discovery).
-func applyBackupDirectory(ctx context.Context, c *k8s.Clients, backupPath, ns string) error {
-	coreApplied := make(map[string]bool)
-	for _, gvr := range backup.CoreResourceTypes() {
-		dir := filepath.Join(backupPath, gvr.Resource)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			continue
-		}
-		applyDir(ctx, c, dir, &gvr, ns)
-		coreApplied[gvr.Resource] = true
+// Pass 1: apply coreResourceTypes (dependency-ordered: SA → CM → PVC → …).
+// Pass 2: apply any remaining resource directories discovered from S3 that were
+// not covered by coreResourceTypes (third-party CRD instances).
+func applyBackupDirectory(ctx context.Context, c *k8s.Clients, keyPrefix, ns string) error {
+	// If c.S3 is nil (e.g. in unit tests with fake clients), skip S3 operations.
+	if c.S3 == nil {
+		log.Printf("restore: S3 client not configured — skipping manifest apply for %q", keyPrefix)
+		return nil
 	}
 
-	// Second pass: CRD directories not already handled.
-	topEntries, err := os.ReadDir(backupPath)
+	// List every key under this backup's prefix in S3.
+	// Keys look like: <ns>/<backup-name>/<resource>/<name>.yaml
+	allKeys, err := store.ListKeys(ctx, c.S3, keyPrefix+"/")
 	if err != nil {
-		return fmt.Errorf("read backup dir %q: %w", backupPath, err)
+		return fmt.Errorf("list S3 keys under %q: %w", keyPrefix, err)
 	}
-	for _, e := range topEntries {
-		if !e.IsDir() || coreApplied[e.Name()] {
-			continue
+
+	// Index keys by resource directory name (the segment after keyPrefix/).
+	// e.g. "my-app/my-backup-01/configmaps/cfg.yaml" → resource="configmaps"
+	keysByResource := make(map[string][]string) // resource → []key
+	for _, key := range allKeys {
+		// Strip the keyPrefix and leading slash to get the relative path.
+		rel := strings.TrimPrefix(key, keyPrefix+"/") // e.g. "configmaps/cfg.yaml"
+		parts := strings.SplitN(rel, "/", 2)          // split into resource + file name
+		if len(parts) != 2 || !strings.HasSuffix(parts[1], ".yaml") {
+			continue // skip keys that don't match expected manifest layout
 		}
-		// Pass nil for gvr so applyYAMLFile derives the GVR from the YAML content.
-		applyDir(ctx, c, filepath.Join(backupPath, e.Name()), nil, ns)
+		resource := parts[0]                                             // e.g. "configmaps"
+		keysByResource[resource] = append(keysByResource[resource], key) // group by resource
+	}
+
+	// Pass 1: apply core resource types in dependency order.
+	coreApplied := make(map[string]bool) // track which resources were handled in pass 1
+	for _, gvr := range backup.CoreResourceTypes() {
+		keys, ok := keysByResource[gvr.Resource] // find keys for this resource type
+		if !ok {
+			continue // this resource type has no backups — skip silently
+		}
+		applyKeys(ctx, c, keys, &gvr, ns) // apply all objects for this resource type
+		coreApplied[gvr.Resource] = true  // mark as handled so pass 2 skips it
+	}
+
+	// Pass 2: apply any remaining resource directories not covered by coreResourceTypes.
+	for resource, keys := range keysByResource {
+		if coreApplied[resource] {
+			continue // already handled in pass 1
+		}
+		if resource == "pvc-data" {
+			continue // raw PVC archive — not a manifest; skip it
+		}
+		// GVR is unknown for CRD resources — pass nil to derive it from the object content.
+		applyKeys(ctx, c, keys, nil, ns)
 	}
 	return nil
 }
 
-// applyDir applies all .yaml files inside dir.
-// If gvr is non-nil it is used directly; otherwise the GVR is derived from
-// each file's apiVersion/kind fields (used for CRD resources).
-func applyDir(ctx context.Context, c *k8s.Clients, dir string, gvr *schema.GroupVersionResource, ns string) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		log.Printf("restore: read dir %q: %v", dir, err)
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		if err := applyYAMLFile(ctx, c, path, gvr, ns); err != nil {
-			log.Printf("restore: apply %s: %v", path, err)
-			// Best-effort: continue with remaining files.
+// applyKeys fetches each S3 object in keys and applies it to the cluster.
+// If gvr is non-nil it is used directly; otherwise the GVR is derived from the
+// YAML content's apiVersion/kind fields (used for CRD resources).
+func applyKeys(ctx context.Context, c *k8s.Clients, keys []string, gvr *schema.GroupVersionResource, ns string) {
+	for _, key := range keys {
+		if err := applyS3Object(ctx, c, key, gvr, ns); err != nil {
+			log.Printf("restore: apply %s: %v", key, err) // best-effort: log and continue
 		}
 	}
 }
 
-// applyYAMLFile reads one YAML file and applies it to the cluster via
+// applyS3Object downloads one S3 object and applies it to the cluster via
 // Server-Side Apply (create-or-update in one call).  Falls back to Create
 // for older clusters that predate SSA.
-func applyYAMLFile(ctx context.Context, c *k8s.Clients, path string, gvr *schema.GroupVersionResource, targetNS string) error {
-	obj, err := store.ReadYAML(path)
+func applyS3Object(ctx context.Context, c *k8s.Clients, key string, gvr *schema.GroupVersionResource, targetNS string) error {
+	// Download and decode the YAML manifest from S3.
+	obj, err := store.GetObject(ctx, c.S3, key)
 	if err != nil {
-		return fmt.Errorf("decode %q: %w", path, err)
+		return fmt.Errorf("get S3 object %q: %w", key, err)
 	}
 
+	// Wrap the decoded map in an Unstructured object for the dynamic client.
 	u := &unstructured.Unstructured{Object: obj}
-	u.SetNamespace(targetNS)
-	u.SetResourceVersion("")
-	u.SetUID("")
-	u.SetCreationTimestamp(metav1.Time{})
-	u.SetManagedFields(nil)
-	delete(u.Object, "status")
+	u.SetNamespace(targetNS)              // override namespace to the restore target
+	u.SetResourceVersion("")              // must be blank for a clean SSA apply
+	u.SetUID("")                          // UID is server-assigned — strip it
+	u.SetCreationTimestamp(metav1.Time{}) // creation time is server-assigned — strip it
+	u.SetManagedFields(nil)               // managed fields are server-side metadata
+	delete(u.Object, "status")            // status is reconciled by controllers, not stored
 
+	// Resolve the GVR: use the provided one or derive it from the object's apiVersion/kind.
 	resolved := gvr
 	if resolved == nil {
 		derived, err := gvrFromObject(c, u)
 		if err != nil {
-			return fmt.Errorf("derive GVR for %q: %w", path, err)
+			return fmt.Errorf("derive GVR for %q: %w", key, err)
 		}
 		resolved = &derived
 	}
 
+	// Marshal the cleaned object back to JSON for the patch call.
 	raw, err := json.Marshal(u.Object)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return fmt.Errorf("marshal object for %q: %w", key, err)
 	}
 
+	// Server-Side Apply: create or update the object in one atomic call.
 	_, err = c.Dynamic.Resource(*resolved).Namespace(targetNS).Patch(
 		ctx,
 		u.GetName(),
-		types.ApplyPatchType,
+		types.ApplyPatchType, // SSA patch type
 		raw,
 		metav1.PatchOptions{FieldManager: "replic2-restore", Force: boolPtr(true)},
 	)
@@ -317,35 +349,48 @@ func applyYAMLFile(ctx context.Context, c *k8s.Clients, path string, gvr *schema
 	return nil
 }
 
-// gvrFromObject looks up the GVR for an Unstructured object by querying
-// the discovery client using the object's apiVersion and kind.
+// gvrFromObject looks up the GVR for an Unstructured object by querying the
+// discovery client using the object's apiVersion and kind.
 // Used for third-party CRD objects where no static GVR is known.
 func gvrFromObject(c *k8s.Clients, u *unstructured.Unstructured) (schema.GroupVersionResource, error) {
-	gvk := u.GroupVersionKind()
+	gvk := u.GroupVersionKind() // extract apiVersion+kind from the object
+
+	// Query the API server's discovery endpoint for all preferred namespaced resources.
 	mapper, err := c.Discovery.ServerPreferredResources()
 	if err != nil && mapper == nil {
 		return schema.GroupVersionResource{}, fmt.Errorf("discovery: %w", err)
 	}
+
+	// Walk the resource lists to find one whose group/version and kind match.
 	for _, list := range mapper {
-		gv, err := schema.ParseGroupVersion(list.GroupVersion)
+		gv, err := schema.ParseGroupVersion(list.GroupVersion) // parse "apps/v1" or "v1"
 		if err != nil {
-			continue
+			continue // skip unparseable group versions
 		}
 		if gv.Group != gvk.Group || gv.Version != gvk.Version {
-			continue
+			continue // wrong group or version — skip this list
 		}
 		for _, r := range list.APIResources {
-			if r.Kind == gvk.Kind && !strings.Contains(r.Name, "/") {
+			// Sub-resources (e.g. "pods/log") contain "/" — skip them.
+			if strings.Contains(r.Name, "/") {
+				continue
+			}
+			if r.Kind == gvk.Kind {
 				return schema.GroupVersionResource{
 					Group:    gv.Group,
 					Version:  gv.Version,
-					Resource: r.Name,
+					Resource: r.Name, // e.g. "certificates" for cert.cert-manager.io
 				}, nil
 			}
 		}
 	}
 	return schema.GroupVersionResource{}, fmt.Errorf("no resource found for GVK %s", gvk)
 }
+
+// ---------------------------------------------------------------------------
+// Exported wrappers — thin shims that expose internal functions to the test
+// suite without changing the internal API.
+// ---------------------------------------------------------------------------
 
 // GVRFromObject is the exported version used in tests.
 func GVRFromObject(c *k8s.Clients, u *unstructured.Unstructured) (schema.GroupVersionResource, error) {
@@ -363,35 +408,43 @@ func FindBackupPath(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) (s
 }
 
 // ApplyBackupDirectory is the exported version used in tests.
-func ApplyBackupDirectory(ctx context.Context, c *k8s.Clients, backupPath, ns string) error {
-	return applyBackupDirectory(ctx, c, backupPath, ns)
+func ApplyBackupDirectory(ctx context.Context, c *k8s.Clients, keyPrefix, ns string) error {
+	return applyBackupDirectory(ctx, c, keyPrefix, ns)
 }
 
 // ReconcileRestores is the exported entry point for tests.
 func ReconcileRestores(ctx context.Context, c *k8s.Clients) error { return reconcile(ctx, c) }
 
+// ---------------------------------------------------------------------------
+// Status helpers
+// ---------------------------------------------------------------------------
+
 // patchStatus writes only the status sub-object back via a merge-patch on the
 // /status subresource; falls back to a full Update if necessary.
 func patchStatus(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) error {
+	// Build the JSON merge-patch body: {"status": { … }}.
 	statusOnly, err := json.Marshal(map[string]interface{}{"status": r.Status})
 	if err != nil {
 		return fmt.Errorf("marshal status: %w", err)
 	}
 
+	// Attempt the preferred path: subresource patch.
 	_, err = c.Dynamic.Resource(GVR).
 		Patch(ctx, r.Name, types.MergePatchType, statusOnly, metav1.PatchOptions{}, "status")
 	if err == nil {
-		return nil
+		return nil // success
 	}
 
+	// Fallback: re-fetch to get the current resourceVersion, inject our status, and Update.
 	latest, getErr := c.Dynamic.Resource(GVR).Get(ctx, r.Name, metav1.GetOptions{})
 	if getErr != nil {
 		return fmt.Errorf("patch status (subresource): %v; re-fetch: %w", err, getErr)
 	}
-	raw, _ := json.Marshal(r.Status)
+	raw, _ := json.Marshal(r.Status) // marshal our typed struct to JSON
 	var statusMap map[string]interface{}
-	_ = json.Unmarshal(raw, &statusMap)
-	latest.Object["status"] = statusMap
+	_ = json.Unmarshal(raw, &statusMap) // decode into a generic map
+	latest.Object["status"] = statusMap // overwrite the status field
+
 	if _, updateErr := c.Dynamic.Resource(GVR).Update(ctx, latest, metav1.UpdateOptions{}); updateErr != nil {
 		return fmt.Errorf("patch status (subresource): %v; update fallback: %w", err, updateErr)
 	}
@@ -403,9 +456,11 @@ func markFailed(ctx context.Context, c *k8s.Clients, r *apitypes.Restore, cause 
 	now := metav1.Now()
 	r.Status.Phase = apitypes.PhaseFailed
 	r.Status.CompletedAt = &now
-	r.Status.Message = cause.Error()
-	_ = patchStatus(ctx, c, r)
-	return cause
+	r.Status.Message = cause.Error() // record the failure reason
+	_ = patchStatus(ctx, c, r)       // best-effort — ignore patch error on failure path
+	return cause                     // propagate the original error
 }
 
+// boolPtr returns a pointer to the given bool value.
+// Used for the Force field in SSA PatchOptions.
 func boolPtr(b bool) *bool { return &b }

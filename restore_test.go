@@ -2,13 +2,11 @@ package main
 
 // restore_test.go — unit tests for the restore controller.
 //
-// Uses fake k8s clients and a temp directory to simulate PVC storage.
+// Uses fake k8s clients only; all S3 operations are skipped when c.S3 == nil.
 
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -155,46 +153,56 @@ func TestEnsureNamespace_ExistingNamespaceNoError(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestFindBackupPath_AutoSelect(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("BACKUP_ROOT", root)
-
 	ns := "my-app"
-	nsDir := filepath.Join(root, ns)
-	_ = os.MkdirAll(filepath.Join(nsDir, "backup-old"), 0o755)
-	time.Sleep(5 * time.Millisecond) // ensure different mtime
-	_ = os.MkdirAll(filepath.Join(nsDir, "backup-new"), 0o755)
 
-	c := newTestClientsWithRestoreScheme()
-	r := &types.Restore{
-		Spec: types.RestoreSpec{Namespace: ns},
+	// Create two completed Backup CRs for the same namespace with different
+	// completedAt timestamps; FindBackupPath should return the newer one's StoragePath.
+	oldTime := metav1.NewTime(time.Now().Add(-2 * time.Hour)) // older backup
+	newTime := metav1.NewTime(time.Now().Add(-1 * time.Hour)) // newer backup
+
+	makeBackup := func(name, storagePath string, completedAt metav1.Time) *unstructured.Unstructured {
+		b := &types.Backup{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "replic2.io/v1alpha1", Kind: "Backup"},
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       types.BackupSpec{Namespace: ns},
+			Status: types.BackupStatus{
+				Phase:       "Completed",
+				StoragePath: storagePath,
+				CompletedAt: &completedAt,
+			},
+		}
+		raw, _ := json.Marshal(b)
+		var obj map[string]interface{}
+		_ = json.Unmarshal(raw, &obj)
+		return &unstructured.Unstructured{Object: obj}
 	}
+
+	oldBackup := makeBackup("backup-old", ns+"/backup-old", oldTime)
+	newBackup := makeBackup("backup-new", ns+"/backup-new", newTime)
+
+	// Register both Backup CRs in the fake dynamic client.
+	c := newTestClientsWithRestoreScheme(oldBackup, newBackup)
+	r := &types.Restore{Spec: types.RestoreSpec{Namespace: ns}}
 
 	ctx := context.Background()
 	got, err := restorectl.FindBackupPath(ctx, c, r)
 	if err != nil {
 		t.Fatalf("FindBackupPath error: %v", err)
 	}
-	want := filepath.Join(nsDir, "backup-new")
+	want := ns + "/backup-new" // newer backup's S3 key prefix
 	if got != want {
 		t.Errorf("FindBackupPath = %q; want %q", got, want)
 	}
 }
 
 func TestFindBackupPath_ExplicitBackupName(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("BACKUP_ROOT", root)
-
 	ns := "my-app"
 	backupName := "explicit-backup"
-	storagePath := filepath.Join(root, ns, backupName)
-	_ = os.MkdirAll(storagePath, 0o755)
+	storagePath := ns + "/" + backupName // S3 key prefix (no filesystem path)
 
 	// Create a Backup CR in the fake client with the storage path set.
 	backupObj := &types.Backup{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "replic2.io/v1alpha1",
-			Kind:       "Backup",
-		},
+		TypeMeta:   metav1.TypeMeta{APIVersion: "replic2.io/v1alpha1", Kind: "Backup"},
 		ObjectMeta: metav1.ObjectMeta{Name: backupName},
 		Spec:       types.BackupSpec{Namespace: ns},
 		Status:     types.BackupStatus{Phase: "Completed", StoragePath: storagePath},
@@ -204,28 +212,7 @@ func TestFindBackupPath_ExplicitBackupName(t *testing.T) {
 	_ = json.Unmarshal(raw, &obj)
 	u := &unstructured.Unstructured{Object: obj}
 
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "replic2.io", Version: "v1alpha1", Kind: "Backup"},
-		&unstructured.Unstructured{},
-	)
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "replic2.io", Version: "v1alpha1", Kind: "BackupList"},
-		&unstructured.UnstructuredList{},
-	)
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "replic2.io", Version: "v1alpha1", Kind: "Restore"},
-		&unstructured.Unstructured{},
-	)
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "replic2.io", Version: "v1alpha1", Kind: "RestoreList"},
-		&unstructured.UnstructuredList{},
-	)
-
-	dyn := dynamicfake.NewSimpleDynamicClient(scheme, u)
-	coreClient := kubernetesfake.NewSimpleClientset()
-	c := &k8s.Clients{Core: coreClient, Dynamic: dyn, Discovery: coreClient.Discovery()}
-
+	c := newTestClientsWithRestoreScheme(u)
 	r := &types.Restore{
 		Spec: types.RestoreSpec{Namespace: ns, BackupName: backupName},
 	}
@@ -241,9 +228,7 @@ func TestFindBackupPath_ExplicitBackupName(t *testing.T) {
 }
 
 func TestFindBackupPath_NoBackupsError(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("BACKUP_ROOT", root)
-
+	// No Backup CRs in the fake client — FindBackupPath must return an error.
 	c := newTestClientsWithRestoreScheme()
 	r := &types.Restore{Spec: types.RestoreSpec{Namespace: "no-backups-ns"}}
 
@@ -259,61 +244,22 @@ func TestFindBackupPath_NoBackupsError(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestApplyBackupDirectory_CoreTypeInOrder(t *testing.T) {
-	root := t.TempDir()
-
-	// Create a fake configmap YAML in the backup directory.
-	cmDir := filepath.Join(root, "configmaps")
-	if err := os.MkdirAll(cmDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	yamlContent := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test-cfg\n  namespace: src-ns\ndata:\n  key: value\n"
-	if err := os.WriteFile(filepath.Join(cmDir, "test-cfg.yaml"), []byte(yamlContent), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Set up a fake dynamic client that has ConfigMap registered.
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"},
-		&unstructured.Unstructured{},
-	)
-	scheme.AddKnownTypeWithName(
-		schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMapList"},
-		&unstructured.UnstructuredList{},
-	)
-
-	dyn := dynamicfake.NewSimpleDynamicClient(scheme)
-	coreClient := kubernetesfake.NewSimpleClientset()
-	c := &k8s.Clients{Core: coreClient, Dynamic: dyn, Discovery: coreClient.Discovery()}
-
+	// When c.S3 is nil, ApplyBackupDirectory skips all S3 work and returns nil.
+	// This verifies the nil guard does not panic and returns cleanly.
+	c := newTestClientsWithRestoreScheme()
 	ctx := context.Background()
-	// ApplyBackupDirectory is best-effort — it logs errors and continues.
-	// We simply verify it does not return an error itself.
-	if err := restorectl.ApplyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
+	if err := restorectl.ApplyBackupDirectory(ctx, c, "my-app/my-backup-01", "target-ns"); err != nil {
 		t.Fatalf("ApplyBackupDirectory error: %v", err)
 	}
 }
 
 func TestApplyBackupDirectory_UnknownSubdirSkipped(t *testing.T) {
-	root := t.TempDir()
-
-	// Create a subdirectory that is not a core type (simulating a CRD).
-	crdDir := filepath.Join(root, "widgets")
-	if err := os.MkdirAll(crdDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A YAML file whose apiVersion points to an unknown group — the discovery
-	// client will not find it, so applyYAMLFile will log an error and continue.
-	yamlContent := "apiVersion: example.io/v1\nkind: Widget\nmetadata:\n  name: my-widget\n  namespace: src-ns\n"
-	if err := os.WriteFile(filepath.Join(crdDir, "my-widget.yaml"), []byte(yamlContent), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+	// When c.S3 is nil, ApplyBackupDirectory skips all S3 work and returns nil
+	// regardless of what keyPrefix is passed — including a prefix that would
+	// contain CRD resource directories in a real backup.
 	c := newTestClientsWithRestoreScheme()
 	ctx := context.Background()
-
-	// Should complete without error even though the CRD type is unknown.
-	if err := restorectl.ApplyBackupDirectory(ctx, c, root, "target-ns"); err != nil {
+	if err := restorectl.ApplyBackupDirectory(ctx, c, "my-app/my-backup-01", "target-ns"); err != nil {
 		t.Fatalf("ApplyBackupDirectory error: %v", err)
 	}
 }
