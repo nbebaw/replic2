@@ -1,11 +1,11 @@
 # replic2
 
-A Kubernetes operator and HTTP server that provides namespace-scoped backup and restore via Custom Resources.
+A Kubernetes operator and HTTP server that provides namespace-scoped backup and restore via Custom Resources, with S3-compatible object storage as the only backend.
 
 ## Features
 
-- **Backup controller** — watches `Backup` CRs; serialises namespace resources to YAML files on a PVC; optionally copies raw PVC data via a temporary agent pod; supports automatic full/incremental backup selection.
-- **Restore controller** — watches `Restore` CRs; re-applies YAML files from the PVC into the cluster using server-side apply.
+- **Backup controller** — watches `Backup` CRs; writes namespace manifests directly to S3 as YAML objects; optionally copies raw PVC data to S3 via a temporary agent pod running `amazon/aws-cli`; auto-selects Full or Incremental backup type.
+- **Restore controller** — watches `Restore` CRs; downloads manifests from S3 and re-applies them via Server-Side Apply; restores raw PVC data by extracting S3 tar archives into freshly provisioned PVCs.
 - **ScheduledBackup controller** — cron-based automatic backup creation.
 - **Leader election** — Lease-based; only the elected pod runs controllers. Standby pods still serve HTTP.
 - **HTTP API** — exposes metadata, health probes, and CR listings.
@@ -30,13 +30,18 @@ A Kubernetes operator and HTTP server that provides namespace-scoped backup and 
 # Install into the replic2 namespace (creates it if absent)
 helm upgrade --install replic2 charts/replic2 \
   --namespace replic2 --create-namespace \
-  --set imagePullSecret.dockerconfigjson=<base64>
+  --set imagePullSecret.dockerconfigjson=<base64> \
+  --set s3.endpoint=http://minio:9000 \
+  --set s3.bucket=replic2-backups \
+  --set s3.accessKeyId=<key> \
+  --set s3.secretAccessKey=<secret> \
+  --set s3.usePathStyle=true
 
 # Uninstall
 helm uninstall replic2 --namespace replic2
 ```
 
-Generate the base64 value with:
+Generate the base64 image pull secret value with:
 
 ```bash
 kubectl create secret docker-registry ghcr-pull-secret \
@@ -46,22 +51,83 @@ kubectl create secret docker-registry ghcr-pull-secret \
   --dry-run=client -o jsonpath='{.data.\.dockerconfigjson}'
 ```
 
-### Key Helm values
+### Helm values reference
 
 | Value | Default | Description |
 |---|---|---|
 | `replicaCount` | `2` | Number of replic2 pods |
 | `image.repository` | `ghcr.io/nbebaw/replic2` | Container image |
-| `image.tag` | chart `appVersion` | Image tag |
-| `imagePullSecret.create` | `true` | Create the GHCR pull secret |
-| `imagePullSecret.dockerconfigjson` | `""` | base64 .dockerconfigjson (required) |
-| `persistence.size` | `10Gi` | Backup PVC size |
-| `persistence.storageClassName` | `""` | StorageClass (empty = cluster default) |
-| `service.type` | `NodePort` | Service type |
-| `service.nodePort` | `30080` | NodePort number |
+| `image.tag` | chart `appVersion` | Image tag (defaults to chart appVersion) |
+| `image.pullPolicy` | `Always` | Image pull policy |
+| `imagePullSecret.create` | `true` | Create the GHCR pull secret from the value below |
+| `imagePullSecret.dockerconfigjson` | `""` | base64-encoded .dockerconfigjson **(required)** |
+| `s3.endpoint` | `""` | S3 endpoint URL — leave empty for AWS; set for MinIO |
+| `s3.bucket` | `replic2-backups` | S3 bucket name **(required)** |
+| `s3.region` | `us-east-1` | AWS region (any string for MinIO) |
+| `s3.usePathStyle` | `false` | Path-style addressing — set `true` for MinIO |
+| `s3.accessKeyId` | `""` | S3 access key ID **(required)** |
+| `s3.secretAccessKey` | `""` | S3 secret access key **(required)** |
+| `service.type` | `NodePort` | Service type: `ClusterIP` \| `NodePort` \| `LoadBalancer` |
+| `service.port` | `80` | Service port |
+| `service.nodePort` | `30080` | NodePort number (only when `type=NodePort`) |
+| `service.annotations` | `{}` | Annotations on the Service (e.g. cloud LB annotations) |
+| `service.loadBalancerIP` | `""` | Static IP for LoadBalancer services |
+| `service.loadBalancerSourceRanges` | `[]` | CIDR allowlist for LoadBalancer services |
+| `ingress.enabled` | `false` | Enable an Ingress resource |
+| `ingress.className` | `""` | IngressClass name (e.g. `nginx`, `traefik`, `alb`) |
+| `ingress.annotations` | `{}` | Annotations on the Ingress |
+| `ingress.hosts` | see values.yaml | Host rules and paths |
+| `ingress.tls` | `[]` | TLS configuration |
 | `autoscaling.enabled` | `true` | Enable HPA |
-| `autoscaling.minReplicas` | `2` | HPA min replicas |
-| `autoscaling.maxReplicas` | `10` | HPA max replicas |
+| `autoscaling.minReplicas` | `2` | HPA minimum replicas |
+| `autoscaling.maxReplicas` | `10` | HPA maximum replicas |
+| `autoscaling.targetCPUUtilizationPercentage` | `70` | HPA CPU target |
+| `autoscaling.targetMemoryUtilizationPercentage` | `80` | HPA memory target |
+| `podDisruptionBudget.enabled` | `true` | Enable PodDisruptionBudget |
+| `podDisruptionBudget.minAvailable` | `1` | Minimum pods available during disruptions |
+| `serviceAccount.annotations` | `{}` | ServiceAccount annotations (e.g. AWS IRSA role ARN) |
+| `podAnnotations` | `{}` | Annotations added to every Pod |
+| `nodeSelector` | `{}` | Node selector for Pod scheduling |
+| `tolerations` | `[]` | Tolerations for Pod scheduling |
+| `affinity` | `{}` | Affinity rules for Pod scheduling |
+| `topologySpreadConstraints` | `[]` | Topology spread constraints (Kubernetes 1.19+) |
+| `resources.requests.cpu` | `50m` | CPU request |
+| `resources.requests.memory` | `64Mi` | Memory request |
+| `resources.limits.cpu` | `200m` | CPU limit |
+| `resources.limits.memory` | `128Mi` | Memory limit |
+
+### Ingress examples
+
+```bash
+# nginx ingress controller
+helm upgrade --install replic2 charts/replic2 \
+  --set imagePullSecret.dockerconfigjson=<base64> \
+  --set ingress.enabled=true \
+  --set ingress.className=nginx \
+  --set "ingress.hosts[0].host=replic2.example.com" \
+  --set "ingress.hosts[0].paths[0].path=/" \
+  --set "ingress.tls[0].secretName=replic2-tls" \
+  --set "ingress.tls[0].hosts[0]=replic2.example.com"
+```
+
+```yaml
+# values override file — full ingress example with cert-manager
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: replic2.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: replic2-tls
+      hosts:
+        - replic2.example.com
+```
 
 ---
 
@@ -117,7 +183,7 @@ kubectl describe backup my-app-backup-01
 | `namespace` | string | required | Namespace to back up |
 | `type` | string | auto | `Full` or `Incremental`. Auto-selects Full on first run, Incremental after |
 | `includePVCData` | bool | `false` | Also copy raw data from every bound PVC in the namespace |
-| `ttl` | string | — | Go duration (e.g. `24h`). CR and PVC data are deleted after `completedAt + ttl` |
+| `ttl` | string | — | Go duration (e.g. `24h`). CR and S3 data are deleted after `completedAt + ttl` |
 
 #### Backup status fields written by the controller
 
@@ -126,7 +192,7 @@ kubectl describe backup my-app-backup-01
 | `phase` | `Pending` → `InProgress` → `Completed` \| `Failed` |
 | `backupType` | `Full` or `Incremental` — what was actually performed |
 | `basedOn` | Name of the previous Backup CR this incremental is built on. Empty for full backups |
-| `storagePath` | Directory on the backup PVC where this backup was written |
+| `storagePath` | S3 key prefix for this backup (e.g. `my-app/my-backup-01`) |
 | `startedAt` / `completedAt` | Timestamps |
 | `message` | Human-readable status string |
 
@@ -148,6 +214,13 @@ kubectl get restores
 kubectl describe restore my-app-restore-01
 ```
 
+The restore controller:
+1. Re-creates the namespace if it was deleted.
+2. Re-applies all backed-up manifests via Server-Side Apply (dependency-ordered).
+3. Waits for each PVC to become `Bound`, then restores raw data from S3 into the new PVC.
+
+> Only full backup archives are used for PVC data restore. Incremental archives cannot be extracted stand-alone.
+
 ### Resource types backed up (in restore order)
 
 1. ServiceAccounts
@@ -161,25 +234,22 @@ kubectl describe restore my-app-restore-01
 
 > Secrets are **not** included by default.
 
-### Backup storage layout on PVC
+### Backup storage layout on S3
 
 ```
-/data/backups/
-  <namespace>/
-    <backup-name>/
-      serviceaccounts/
-        default.yaml
-      configmaps/
-        my-config.yaml
-      deployments/
-        my-app.yaml
-      ...
-      pvc-data/                        # only present when includePVCData: true
-        <pvc-name>.tar                 # full backup archive
-        <pvc-name>-incremental.tar     # incremental backup archive
+<namespace>/
+  <backup-name>/
+    serviceaccounts/
+      default.yaml
+    configmaps/
+      my-config.yaml
+    deployments/
+      my-app.yaml
+    ...
+    pvc-data/                        # only present when includePVCData: true
+      <pvc-name>.tar                 # full backup archive
+      <pvc-name>-incremental.tar     # incremental backup archive
 ```
-
-Override the root path with the `BACKUP_ROOT` environment variable (default: `/data/backups`).
 
 ---
 
@@ -191,7 +261,12 @@ Override the root path with the `BACKUP_ROOT` environment variable (default: `/d
 | `APP_VERSION` | `0.2.0` | Reported in `GET /` |
 | `POD_NAMESPACE` | `default` | Namespace for leader election Lease |
 | `POD_NAME` | OS hostname | Leader election identity |
-| `BACKUP_ROOT` | `/data/backups` | PVC mount path for backup storage |
+| `S3_ENDPOINT` | `""` | S3 endpoint URL (empty = AWS; set for MinIO) |
+| `S3_BUCKET` | `""` | S3 bucket name **(required)** |
+| `S3_REGION` | `us-east-1` | AWS region |
+| `S3_ACCESS_KEY_ID` | `""` | S3 access key ID **(required)** |
+| `S3_SECRET_ACCESS_KEY` | `""` | S3 secret access key **(required)** |
+| `S3_USE_PATH_STYLE` | `false` | Path-style S3 URLs — required for MinIO |
 | `KUBECONFIG` | `~/.kube/config` | Kubeconfig path (local dev only) |
 
 ---
@@ -258,8 +333,8 @@ kubectl apply -f deploy/crd-restore.yaml
 kubectl apply -f deploy/crd-scheduledbackup.yaml
 kubectl apply -f deploy/rbac.yaml
 kubectl apply -f deploy/serviceaccount.yaml
-kubectl apply -f deploy/pvc.yaml
-kubectl apply -f deploy/secret-ghcr.yaml   # edit .dockerconfigjson first
+kubectl apply -f deploy/secret-s3.yaml       # edit S3 credentials first
+kubectl apply -f deploy/secret-ghcr.yaml     # edit .dockerconfigjson first
 kubectl apply -f deploy/deployment.yaml
 kubectl apply -f deploy/service.yaml
 kubectl apply -f deploy/hpa.yaml
@@ -293,19 +368,22 @@ replic2/
 │       ├── _helpers.tpl
 │       ├── serviceaccount.yaml
 │       ├── rbac.yaml
-│       ├── pvc.yaml
 │       ├── secret-ghcr.yaml
+│       ├── secret-s3.yaml
 │       ├── deployment.yaml
 │       ├── service.yaml
+│       ├── ingress.yaml
 │       ├── hpa.yaml
+│       ├── poddisruptionbudget.yaml
 │       └── crds/
 │           ├── crd-backup.yaml
 │           ├── crd-restore.yaml
 │           └── crd-scheduledbackup.yaml
 └── internal/
     ├── k8s/client.go                       — Kubernetes client initialisation
+    ├── s3/client.go                        — S3 client init from env vars
     ├── types/types.go                      — CRD Go types + scheme registration
-    ├── store/store.go                      — PVC file I/O helpers
+    ├── store/store.go                      — S3 I/O helpers (PutObject, GetObject, ListKeys, DeletePrefix)
     ├── leader/leader.go                    — Lease-based leader election
     ├── server/
     │   ├── server.go                       — HTTP router (gin); route registration
@@ -320,9 +398,10 @@ replic2/
         ├── backup/
         │   ├── backup.go                   — poll loop, constants, exported wrappers
         │   ├── process.go                  — process(), FindLatestCompletedBackup()
-        │   ├── manifests.go                — resource type discovery, VerbSupported()
-        │   ├── pvcdata.go                  — agent pod + log streaming for PVC data
-        │   └── status.go                   — status patching, expiry helpers
-        ├── restore/restore.go              — Restore controller
+        │   ├── manifests.go                — resource type discovery, S3 PutObject for manifests
+        │   ├── pvcdata.go                  — agent pod that tars PVC data and streams to S3
+        │   └── status.go                   — status patching, TTL expiry, S3 DeletePrefix
+        ├── restore/
+        │   └── restore.go                  — manifest restore from S3; PVC data restore via agent pod
         └── scheduled/scheduled.go         — ScheduledBackup controller
 ```

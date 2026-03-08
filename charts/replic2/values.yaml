@@ -12,8 +12,7 @@ image:
   # -- Image pull policy
   pullPolicy: Always
 
-# -- Image pull secret name for GHCR (or any private registry).
-#    The secret must already exist in the namespace, or set imagePullSecret.create=true.
+# -- Image pull secret for GHCR (or any private registry).
 imagePullSecret:
   # -- Create the dockerconfigjson secret from the values below.
   #    Set to false if you create the secret out-of-band.
@@ -53,12 +52,48 @@ s3:
 
 # Service configuration
 service:
-  # -- Service type
+  # -- Service type: ClusterIP | NodePort | LoadBalancer
   type: NodePort
   # -- Port exposed by the Service
   port: 80
   # -- NodePort number (only used when type=NodePort). Leave 0 to let Kubernetes assign one.
   nodePort: 30080
+  # -- Optional annotations on the Service (e.g. for AWS NLB, cloud load balancers)
+  annotations: {}
+  # -- Static ClusterIP (only used when type=ClusterIP). Leave empty for auto-assignment.
+  clusterIP: ""
+  # -- Static IP for LoadBalancer (only used when type=LoadBalancer).
+  loadBalancerIP: ""
+  # -- CIDR ranges that may access the LoadBalancer (only used when type=LoadBalancer).
+  loadBalancerSourceRanges: []
+
+# Ingress configuration
+ingress:
+  # -- Enable an Ingress resource. Requires an ingress controller in the cluster
+  #    (e.g. ingress-nginx, Traefik, AWS ALB ingress controller).
+  enabled: false
+  # -- IngressClass name (e.g. "nginx", "traefik", "alb").
+  #    Corresponds to spec.ingressClassName in networking.k8s.io/v1.
+  className: ""
+  # -- Annotations applied to the Ingress resource.
+  #    Common examples:
+  #      nginx.ingress.kubernetes.io/rewrite-target: /
+  #      cert-manager.io/cluster-issuer: letsencrypt-prod
+  annotations: {}
+  # -- Ingress host rules.
+  #    Each entry defines a hostname and the paths that map to replic2.
+  hosts:
+    - host: replic2.example.com
+      paths:
+        - path: /
+          # -- pathType: Prefix | Exact | ImplementationSpecific
+          pathType: Prefix
+  # -- TLS configuration. Each entry specifies a secret and the hostnames it covers.
+  #    The TLS secret must already exist in the namespace (or be created by cert-manager).
+  tls: []
+  #  - secretName: replic2-tls
+  #    hosts:
+  #      - replic2.example.com
 
 # HPA configuration
 autoscaling:
@@ -70,6 +105,59 @@ autoscaling:
   targetCPUUtilizationPercentage: 70
   # -- Target memory utilisation percentage
   targetMemoryUtilizationPercentage: 80
+
+# PodDisruptionBudget — keeps at least N pods available during voluntary disruptions
+# (node drains, rolling upgrades). Recommended when replicaCount >= 2.
+podDisruptionBudget:
+  # -- Enable the PodDisruptionBudget
+  enabled: true
+  # -- Minimum number of pods that must remain available. Mutually exclusive with maxUnavailable.
+  minAvailable: 1
+  # -- Maximum number of pods that may be unavailable. Mutually exclusive with minAvailable.
+  maxUnavailable: ""
+
+# ServiceAccount annotations — useful for IRSA (AWS IAM Roles for Service Accounts)
+# or Workload Identity (GKE / Azure).
+serviceAccount:
+  annotations: {}
+  # Example for AWS IRSA:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/replic2-s3-role
+
+# -- Annotations added to every replic2 Pod.
+podAnnotations: {}
+# Example:
+#   prometheus.io/scrape: "true"
+#   prometheus.io/port: "8080"
+
+# -- Node selector applied to every replic2 Pod.
+nodeSelector: {}
+
+# -- Tolerations applied to every replic2 Pod.
+tolerations: []
+
+# -- Affinity rules applied to every replic2 Pod.
+#    By default no affinity is set; the example below spreads pods across nodes.
+affinity: {}
+# Example — prefer different nodes:
+#   podAntiAffinity:
+#     preferredDuringSchedulingIgnoredDuringExecution:
+#       - weight: 100
+#         podAffinityTerm:
+#           labelSelector:
+#             matchLabels:
+#               app.kubernetes.io/name: replic2
+#           topologyKey: kubernetes.io/hostname
+
+# -- TopologySpreadConstraints applied to every replic2 Pod.
+#    Requires Kubernetes 1.19+. Spreads pods across failure domains.
+topologySpreadConstraints: []
+# Example — spread evenly across nodes:
+#   - maxSkew: 1
+#     topologyKey: kubernetes.io/hostname
+#     whenUnsatisfiable: DoNotSchedule
+#     labelSelector:
+#       matchLabels:
+#         app.kubernetes.io/name: replic2
 
 # Resource requests and limits for the replic2 container
 resources:
