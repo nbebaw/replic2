@@ -6,7 +6,11 @@
 // short-lived "agent" pod in the source namespace that:
 //
 //  1. Mounts the source PVC at /data (read-only).
-//  2. Mounts the backup PVC via a HostPath at store.BackupRoot() (write).
+//  2. Mounts the replic2 backup PVC (store.BackupPVCName()) at
+//     store.BackupRoot() (read-write) — using a PVC volume, not a HostPath.
+//     This is required because the backup root only exists inside the replic2
+//     pod; the path does not exist on the underlying node filesystem, so a
+//     HostPath mount would fail with "read-only file system" at container init.
 //  3. Runs "tar -cf <archivePath> -C /data ." to archive all files.
 //     For incremental backups, "--newer-mtime=<RFC3339>" is prepended so only
 //     files modified after the previous backup's completedAt are included.
@@ -102,10 +106,13 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 		podName = podName[:63] // hard cap at the Kubernetes DNS label limit
 	}
 
-	backupRoot := store.BackupRoot() // the path where replic2's backup PVC is mounted
+	backupRoot := store.BackupRoot()   // where the backup PVC is mounted in the agent pod
+	backupPVC := store.BackupPVCName() // the PVC that holds all backups
 
 	// Define the agent pod.  It uses BusyBox for the tar command, mounts the
-	// source PVC read-only and the backup storage read-write via HostPath.
+	// source PVC read-only and the replic2 backup PVC read-write.
+	// We mount the backup PVC directly (not via HostPath) because the backup
+	// root path only exists inside the replic2 pod — not on the host node.
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -129,8 +136,8 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 							ReadOnly:  true,
 						},
 						{
-							Name:      "backup-storage", // the backup PVC (write destination)
-							MountPath: backupRoot,       // same path as in the replic2 pod
+							Name:      "backup-storage", // the replic2 backup PVC (write destination)
+							MountPath: backupRoot,       // same mount path as in the replic2 pod
 						},
 					},
 				},
@@ -147,12 +154,14 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 					},
 				},
 				{
-					// backup-storage: HostPath pointing at the backup PVC's mount on the node.
-					// This lets the agent pod write the archive directly without streaming.
+					// backup-storage: the replic2 backup PVC mounted directly.
+					// Using a PVC volume (not HostPath) because the backup root path
+					// only exists inside the replic2 container, not on the node.
 					Name: "backup-storage",
 					VolumeSource: corev1.VolumeSource{
-						HostPath: &corev1.HostPathVolumeSource{
-							Path: backupRoot, // the node-local path of the backup PVC
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: backupPVC, // e.g. "replic2-backups" (store.BackupPVCName())
+							ReadOnly:  false,     // we need to write the tar archive here
 						},
 					},
 				},
