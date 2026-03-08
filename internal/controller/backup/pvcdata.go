@@ -109,10 +109,17 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 
 	// Build the shell command.  For incremental backups we use find -newer to
 	// limit the archive to files modified after sinceTime.
+	// The amazon/aws-cli image (Amazon Linux 2023) does not include tar by
+	// default, so we install it first with a quiet yum call.  The install is
+	// fast (~1 s) because the package is tiny and the Amazon Linux repo is
+	// always reachable inside any cloud/kind cluster.
 	var shellCmd string
 	if sinceTime.IsZero() {
 		// Full backup: archive everything under /data.
-		shellCmd = fmt.Sprintf(`tar -c -C /data . | aws s3 cp - '%s'%s`, s3URI, endpointFlag)
+		shellCmd = fmt.Sprintf(
+			`yum install -y -q tar && tar -c -C /data . | aws s3 cp - '%s'%s`,
+			s3URI, endpointFlag,
+		)
 	} else {
 		// Incremental backup:
 		//   1. Create a reference file with the cutoff timestamp.
@@ -120,7 +127,7 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 		//   3. Pipe that file list into tar, then upload to S3.
 		ts := sinceTime.UTC().Format("2006-01-02 15:04:05") // touch -d format
 		shellCmd = fmt.Sprintf(
-			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files | aws s3 cp - '%s'%s`,
+			`yum install -y -q tar && touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files | aws s3 cp - '%s'%s`,
 			ts, s3URI, endpointFlag,
 		)
 	}
