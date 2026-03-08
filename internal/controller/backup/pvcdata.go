@@ -38,8 +38,9 @@ import (
 	"path/filepath" // for Join (build archive path)
 	"time"          // for sinceTime, agentPodTimeout, RFC3339 format
 
-	corev1 "k8s.io/api/core/v1"                   // Pod, PVC types and phase constants
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // ObjectMeta, ListOptions, DeleteOptions
+	corev1 "k8s.io/api/core/v1"                    // Pod, PVC types and phase constants
+	k8serrors "k8s.io/apimachinery/pkg/api/errors" // IsNotFound
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"  // ObjectMeta, ListOptions, DeleteOptions
 
 	"replic2/internal/k8s"            // Kubernetes client wrapper (c.Core)
 	apitypes "replic2/internal/types" // Backup struct (b.Name for logging/labels)
@@ -166,8 +167,12 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 		},
 	}
 
-	// Delete any leftover pod from a previous (failed) attempt so Create succeeds.
-	_ = c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
+	// Delete any leftover pod from a previous (failed) attempt so Create succeeds,
+	// then wait until the API server confirms it is gone before creating a new one.
+	// Without the wait, Create can race with the terminating pod and return "already exists".
+	if err := deleteAndWaitForPodGone(ctx, c, ns, podName); err != nil {
+		return fmt.Errorf("cleanup stale agent pod %q: %w", podName, err)
+	}
 
 	if _, err := c.Core.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return fmt.Errorf("create agent pod for PVC %q: %w", pvcName, err)
@@ -244,4 +249,34 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 
 	log.Printf("backup controller: [%s] archived PVC %q → %s (%d bytes)", b.Name, pvcName, archivePath, written)
 	return nil
+}
+
+// deleteAndWaitForPodGone deletes the named pod (ignoring "not found") and then
+// polls until the API server confirms it no longer exists.  This prevents a race
+// where Create is called before the terminating pod has been fully removed.
+func deleteAndWaitForPodGone(ctx context.Context, c *k8s.Clients, ns, podName string) error {
+	// Issue the delete; ignore "not found" — pod may already be absent.
+	err := c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("delete pod: %w", err)
+	}
+
+	// Poll until the pod disappears from the API server.
+	deadline := time.Now().Add(30 * time.Second) // generous but bounded
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pod %q still exists after 30s", podName)
+		}
+		_, err := c.Core.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil && k8serrors.IsNotFound(err) {
+			// Pod is gone — safe to create a new one.
+			return nil
+		}
+		// Still present (or transient API error) — wait and retry.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second): // poll every 2 s
+		}
+	}
 }
