@@ -4,7 +4,7 @@ A Kubernetes operator and HTTP server that provides namespace-scoped backup and 
 
 ## Features
 
-- **Backup controller** — watches `Backup` CRs; serialises namespace resources to YAML files on a PVC.
+- **Backup controller** — watches `Backup` CRs; serialises namespace resources to YAML files on a PVC; optionally copies raw PVC data via a temporary agent pod; supports automatic full/incremental backup selection.
 - **Restore controller** — watches `Restore` CRs; re-applies YAML files from the PVC into the cluster using server-side apply.
 - **ScheduledBackup controller** — cron-based automatic backup creation.
 - **Leader election** — Lease-based; only the elected pod runs controllers. Standby pods still serve HTTP.
@@ -29,6 +29,7 @@ A Kubernetes operator and HTTP server that provides namespace-scoped backup and 
 ### Backup a namespace
 
 ```yaml
+# Minimal — manifests only, type auto-selected (Full on first run, Incremental after)
 apiVersion: replic2.io/v1alpha1
 kind: Backup
 metadata:
@@ -37,11 +38,56 @@ spec:
   namespace: my-app
 ```
 
+```yaml
+# Full backup including raw PVC data, with a 7-day TTL
+apiVersion: replic2.io/v1alpha1
+kind: Backup
+metadata:
+  name: my-app-backup-full
+spec:
+  namespace: my-app
+  type: Full           # "Full" | "Incremental" — omit to auto-select
+  includePVCData: true # also back up raw files from every bound PVC
+  ttl: 168h            # auto-delete after 7 days
+```
+
+```yaml
+# Incremental backup — manifests + only PVC files changed since the last backup
+apiVersion: replic2.io/v1alpha1
+kind: Backup
+metadata:
+  name: my-app-backup-inc-01
+spec:
+  namespace: my-app
+  type: Incremental
+  includePVCData: true
+```
+
 ```bash
 kubectl apply -f backup.yaml
 kubectl get backups
 kubectl describe backup my-app-backup-01
 ```
+
+#### Backup spec fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `namespace` | string | required | Namespace to back up |
+| `type` | string | auto | `Full` or `Incremental`. Auto-selects Full on first run, Incremental after |
+| `includePVCData` | bool | `false` | Also copy raw data from every bound PVC in the namespace |
+| `ttl` | string | — | Go duration (e.g. `24h`). CR and PVC data are deleted after `completedAt + ttl` |
+
+#### Backup status fields written by the controller
+
+| Field | Description |
+|---|---|
+| `phase` | `Pending` → `InProgress` → `Completed` \| `Failed` |
+| `backupType` | `Full` or `Incremental` — what was actually performed |
+| `basedOn` | Name of the previous Backup CR this incremental is built on. Empty for full backups |
+| `storagePath` | Directory on the backup PVC where this backup was written |
+| `startedAt` / `completedAt` | Timestamps |
+| `message` | Human-readable status string |
 
 ### Restore a namespace
 
@@ -87,6 +133,9 @@ kubectl describe restore my-app-restore-01
       deployments/
         my-app.yaml
       ...
+      pvc-data/                        # only present when includePVCData: true
+        <pvc-name>.tar                 # full backup archive
+        <pvc-name>-incremental.tar     # incremental backup archive
 ```
 
 Override the root path with the `BACKUP_ROOT` environment variable (default: `/data/backups`).

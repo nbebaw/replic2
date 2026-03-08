@@ -47,6 +47,18 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Backup type constants
+// ---------------------------------------------------------------------------
+
+const (
+	// BackupTypeFull captures all resources and PVC data from scratch.
+	BackupTypeFull = "Full"
+	// BackupTypeIncremental captures only resources/files that changed since
+	// the most recent completed backup for the same namespace.
+	BackupTypeIncremental = "Incremental"
+)
+
+// ---------------------------------------------------------------------------
 // Backup
 // ---------------------------------------------------------------------------
 
@@ -58,6 +70,13 @@ type BackupSpec struct {
 	// When set, the backup controller deletes the CR and its PVC data after
 	// completedAt + TTL has elapsed.
 	TTL string `json:"ttl,omitempty"`
+	// Type is either "Full" or "Incremental".
+	// When empty the controller auto-selects: Full if no prior completed
+	// backup exists for the namespace, Incremental otherwise.
+	Type string `json:"type,omitempty"`
+	// IncludePVCData when true copies the raw data from every PVC bound in
+	// the target namespace in addition to the Kubernetes manifests.
+	IncludePVCData bool `json:"includePVCData,omitempty"`
 }
 
 // BackupStatus is written back by the backup controller.
@@ -72,6 +91,11 @@ type BackupStatus struct {
 	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 	// StoragePath is the directory on the PVC where YAML files were written.
 	StoragePath string `json:"storagePath,omitempty"`
+	// BasedOn is the name of the Backup CR that this incremental backup is
+	// built on top of.  Empty for full backups.
+	BasedOn string `json:"basedOn,omitempty"`
+	// BackupType records whether this was a "Full" or "Incremental" backup.
+	BackupType string `json:"backupType,omitempty"`
 }
 
 // Backup is the Schema for the backups.replic2.io CRD.
