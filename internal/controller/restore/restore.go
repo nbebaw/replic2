@@ -19,10 +19,11 @@ import (
 	"encoding/json" // to decode unstructured CR bytes from the dynamic client
 	"fmt"           // for error wrapping
 	"log"           // for structured logging
+	"os"            // for reading S3 env vars to pass to the restore agent pod
 	"strings"       // for Contains (skip sub-resources like "pods/log")
-	"time"          // for the poll ticker
+	"time"          // for the poll ticker and agent pod timeout
 
-	corev1 "k8s.io/api/core/v1"                         // Namespace type
+	corev1 "k8s.io/api/core/v1"                         // Namespace, Pod, EnvVar types
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"      // IsNotFound, IsAlreadyExists
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"       // Now(), ListOptions, GetOptions
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured" // Unstructured (dynamic objects)
@@ -34,6 +35,10 @@ import (
 	"replic2/internal/store"             // GetObject, ListKeys, DecodeYAML
 	apitypes "replic2/internal/types"    // Restore struct, phase constants
 )
+
+// restoreAgentPodTimeout is the maximum time to wait for the restore agent pod
+// to complete before treating it as a failure.
+const restoreAgentPodTimeout = 30 * time.Minute
 
 // GVR is the GroupVersionResource for the Restore CRD.
 var GVR = schema.GroupVersionResource{
@@ -123,6 +128,13 @@ func process(ctx context.Context, c *k8s.Clients, r *apitypes.Restore) error {
 	// Apply all manifests stored under keyPrefix in S3.
 	if err := applyBackupDirectory(ctx, c, keyPrefix, ns); err != nil {
 		return markFailed(ctx, c, r, fmt.Errorf("apply resources: %w", err))
+	}
+
+	// Restore raw PVC data from S3 tars (if any were backed up).
+	// This runs after manifests so the PVCs exist and are Bound before we
+	// try to mount them in the restore agent pods.
+	if err := restorePVCData(ctx, c, r, keyPrefix, ns); err != nil {
+		return markFailed(ctx, c, r, fmt.Errorf("restore PVC data: %w", err))
 	}
 
 	// Phase: Completed.
@@ -313,6 +325,28 @@ func applyS3Object(ctx context.Context, c *k8s.Clients, key string, gvr *schema.
 	u.SetManagedFields(nil)               // managed fields are server-side metadata
 	delete(u.Object, "status")            // status is reconciled by controllers, not stored
 
+	// PersistentVolumeClaims: strip the old binding so the provisioner creates
+	// a fresh PV.  Without this, SSA re-applies the old volumeName which points
+	// to a deleted PV, leaving the PVC in "Lost" state forever.
+	if u.GetKind() == "PersistentVolumeClaim" {
+		spec, _, _ := unstructured.NestedMap(u.Object, "spec")
+		if spec != nil {
+			delete(spec, "volumeName") // old PV is gone — let provisioner assign a new one
+			// Annotations that the provisioner writes at bind time must also be
+			// removed so the provisioner does not see them as stale hints.
+			annotations := u.GetAnnotations()
+			delete(annotations, "pv.kubernetes.io/bind-completed")
+			delete(annotations, "pv.kubernetes.io/bound-by-controller")
+			delete(annotations, "volume.beta.kubernetes.io/storage-provisioner")
+			delete(annotations, "volume.kubernetes.io/selected-node")
+			delete(annotations, "volume.kubernetes.io/storage-provisioner")
+			u.SetAnnotations(annotations)
+			if err := unstructured.SetNestedMap(u.Object, spec, "spec"); err != nil {
+				log.Printf("restore: strip PVC binding for %s: %v", u.GetName(), err)
+			}
+		}
+	}
+
 	// Resolve the GVR: use the provided one or derive it from the object's apiVersion/kind.
 	resolved := gvr
 	if resolved == nil {
@@ -385,6 +419,235 @@ func gvrFromObject(c *k8s.Clients, u *unstructured.Unstructured) (schema.GroupVe
 		}
 	}
 	return schema.GroupVersionResource{}, fmt.Errorf("no resource found for GVK %s", gvk)
+}
+
+// ---------------------------------------------------------------------------
+// PVC data restore — agent pods that pull tar archives from S3 into new PVCs.
+// ---------------------------------------------------------------------------
+
+// restorePVCData scans the S3 prefix for pvc-data/*.tar objects.  For each tar
+// found it waits for the matching PVC to be Bound (the provisioner may take a
+// few seconds), then spawns a restore agent pod that downloads the tar from S3
+// and extracts it into the freshly provisioned PVC.
+//
+// This mirrors backupPVCData / backupSinglePVC from the backup controller but
+// in reverse: instead of "tar | aws s3 cp" it runs "aws s3 cp | tar -x".
+func restorePVCData(ctx context.Context, c *k8s.Clients, r *apitypes.Restore, keyPrefix, ns string) error {
+	// Skip if S3 is not configured (unit tests with fake clients).
+	if c.S3 == nil {
+		return nil
+	}
+
+	// List all S3 keys under the pvc-data sub-prefix.
+	pvcPrefix := keyPrefix + "/pvc-data/"
+	keys, err := store.ListKeys(ctx, c.S3, pvcPrefix)
+	if err != nil {
+		return fmt.Errorf("list pvc-data keys: %w", err)
+	}
+	if len(keys) == 0 {
+		log.Printf("restore: [%s] no pvc-data objects found — skipping PVC data restore", r.Name)
+		return nil
+	}
+
+	for _, key := range keys {
+		// Derive PVC name from the archive key.
+		// Key format: <keyPrefix>/pvc-data/<pvcName>.tar  (full)
+		//         or: <keyPrefix>/pvc-data/<pvcName>-incremental.tar
+		// We skip incremental archives — they do not contain a self-consistent
+		// snapshot and cannot be extracted stand-alone.
+		fileName := strings.TrimPrefix(key, pvcPrefix) // e.g. "example-app-data.tar"
+		if strings.HasSuffix(fileName, "-incremental.tar") {
+			log.Printf("restore: [%s] skipping incremental archive %q — full restore only", r.Name, key)
+			continue
+		}
+		if !strings.HasSuffix(fileName, ".tar") {
+			continue // not a tar archive — skip
+		}
+		pvcName := strings.TrimSuffix(fileName, ".tar") // e.g. "example-app-data"
+
+		if err := restoreSinglePVC(ctx, c, r, ns, key, pvcName); err != nil {
+			// One PVC failure should not abort the rest.
+			log.Printf("restore: [%s] PVC %q data restore error: %v", r.Name, pvcName, err)
+		}
+	}
+	return nil
+}
+
+// restoreSinglePVC waits for pvcName to become Bound, then spawns an agent pod
+// that downloads the tar from S3 and extracts it into the PVC's /data mount.
+func restoreSinglePVC(ctx context.Context, c *k8s.Clients, r *apitypes.Restore, ns, s3Key, pvcName string) error {
+	// ------------------------------------------------------------------
+	// 1. Wait for the PVC to reach Bound phase (provisioner may need time).
+	// ------------------------------------------------------------------
+	log.Printf("restore: [%s] waiting for PVC %q to become Bound", r.Name, pvcName)
+	bindDeadline := time.Now().Add(5 * time.Minute)
+	for {
+		if time.Now().After(bindDeadline) {
+			return fmt.Errorf("PVC %q did not become Bound within 5 minutes", pvcName)
+		}
+		pvc, err := c.Core.CoreV1().PersistentVolumeClaims(ns).Get(ctx, pvcName, metav1.GetOptions{})
+		if err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("get PVC %q: %w", pvcName, err)
+		}
+		if err == nil && pvc.Status.Phase == corev1.ClaimBound {
+			break // PVC is ready
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	log.Printf("restore: [%s] PVC %q is Bound — starting data restore", r.Name, pvcName)
+
+	// ------------------------------------------------------------------
+	// 2. Build the S3 source URI and shell command for the agent pod.
+	//    The agent runs: aws s3 cp <s3URI> - | tar -x -C /data
+	//    (reverse of the backup command).
+	// ------------------------------------------------------------------
+	bucket := os.Getenv("S3_BUCKET") // S3 bucket name
+	s3URI := fmt.Sprintf("s3://%s/%s", bucket, s3Key)
+
+	// Build the optional --endpoint-url flag for MinIO / non-AWS providers.
+	endpointFlag := ""
+	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
+		endpointFlag = fmt.Sprintf(" --endpoint-url '%s'", endpoint)
+	}
+
+	// The agent downloads the tar from S3 and pipes it straight into tar -x.
+	// We install tar first (amazon/aws-cli image does not include it by default).
+	shellCmd := fmt.Sprintf(
+		`yum install -y -q tar && aws s3 cp '%s' -%s | tar -x -C /data`,
+		s3URI, endpointFlag,
+	)
+
+	// ------------------------------------------------------------------
+	// 3. Build the pod name (max 63 chars).
+	// ------------------------------------------------------------------
+	podName := fmt.Sprintf("replic2-restore-%s-%s", r.Name, pvcName)
+	if len(podName) > 63 {
+		podName = podName[:63]
+	}
+
+	// ------------------------------------------------------------------
+	// 4. S3 credentials for the agent pod.
+	// ------------------------------------------------------------------
+	agentEnv := []corev1.EnvVar{
+		{Name: "AWS_ACCESS_KEY_ID", Value: os.Getenv("S3_ACCESS_KEY_ID")},
+		{Name: "AWS_SECRET_ACCESS_KEY", Value: os.Getenv("S3_SECRET_ACCESS_KEY")},
+		{Name: "AWS_DEFAULT_REGION", Value: os.Getenv("S3_REGION")},
+	}
+
+	// ------------------------------------------------------------------
+	// 5. Define and create the restore agent pod.
+	//    The PVC is mounted read-write at /data so tar can write into it.
+	// ------------------------------------------------------------------
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: ns,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "replic2",
+				"replic2.io/restore":           r.Name,
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever, // run once; do not retry
+			Containers: []corev1.Container{
+				{
+					Name:    "agent",
+					Image:   "amazon/aws-cli",
+					Command: []string{"sh", "-c", shellCmd},
+					Env:     agentEnv,
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "target-pvc",
+							MountPath: "/data", // extract tar contents here
+							ReadOnly:  false,   // write access required
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "target-pvc",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName, // the freshly provisioned PVC
+							ReadOnly:  false,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Clean up any stale pod from a previous failed attempt before creating.
+	if err := deleteAndWaitForRestorePodGone(ctx, c, ns, podName); err != nil {
+		return fmt.Errorf("cleanup stale restore pod %q: %w", podName, err)
+	}
+
+	if _, err := c.Core.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("create restore agent pod for PVC %q: %w", pvcName, err)
+	}
+	log.Printf("restore: [%s] restore agent pod %q created for PVC %q", r.Name, podName, pvcName)
+
+	// Always clean up the pod when we return.
+	defer func() {
+		_ = c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
+		log.Printf("restore: [%s] restore agent pod %q deleted", r.Name, podName)
+	}()
+
+	// ------------------------------------------------------------------
+	// 6. Poll until the agent pod succeeds or fails.
+	// ------------------------------------------------------------------
+	deadline := time.Now().Add(restoreAgentPodTimeout)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("restore agent pod %q timed out after %s", podName, restoreAgentPodTimeout)
+		}
+		p, err := c.Core.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get restore agent pod %q: %w", podName, err)
+		}
+		switch p.Status.Phase {
+		case corev1.PodSucceeded:
+			log.Printf("restore: [%s] PVC %q data restored from %s", r.Name, pvcName, s3URI)
+			return nil
+		case corev1.PodFailed:
+			return fmt.Errorf("restore agent pod %q failed — check pod logs for details", podName)
+		default:
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+}
+
+// deleteAndWaitForRestorePodGone deletes the named pod (ignoring "not found")
+// and polls until the API server confirms it no longer exists.
+func deleteAndWaitForRestorePodGone(ctx context.Context, c *k8s.Clients, ns, podName string) error {
+	err := c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("delete pod: %w", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pod %q still exists after 30s", podName)
+		}
+		_, err := c.Core.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil && k8serrors.IsNotFound(err) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
