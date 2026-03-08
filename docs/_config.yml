@@ -1,6 +1,6 @@
 title: replic2
 description: Kubernetes namespace backup and restore operator with S3-compatible storage
-theme: just-the-docs
+remote_theme: just-the-docs/just-the-docs
 url: "https://nbebaw.github.io"
 baseurl: "/replic2"
 
