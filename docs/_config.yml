@@ -1,17 +1,17 @@
 title: replic2
 description: Kubernetes namespace backup and restore operator with S3-compatible storage
-theme: jekyll-theme-cayman
+theme: just-the-docs
 url: "https://nbebaw.github.io"
 baseurl: "/replic2"
 
-nav:
-  - title: Home
-    url: /
-  - title: Deploy with Helm
-    url: /helm
-  - title: Custom Resources
-    url: /custom-resources
-  - title: Configuration
-    url: /configuration
-  - title: Development
-    url: /development
+# Just the Docs settings
+search_enabled: true
+heading_anchors: true
+color_scheme: light
+
+aux_links:
+  "GitHub":
+    - "https://github.com/nbebaw/replic2"
+aux_links_new_tab: true
+
+footer_content: "replic2 &mdash; Kubernetes namespace backup and restore."
