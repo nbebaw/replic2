@@ -1,28 +1,38 @@
-// pvcdata.go — raw PVC data backup via a temporary agent pod + exec streaming.
+// pvcdata.go — raw PVC data backup via a self-terminating agent pod.
 //
 // When spec.includePVCData is true, the backup controller cannot mount the
 // source PVC directly (RWO volumes allow only one writer at a time and the
-// source PVC may already be mounted on a different node). Instead it:
+// source PVC may already be mounted on a different node).  Instead it:
 //
 //  1. Spawns a short-lived "agent" pod in the source namespace that mounts
-//     the source PVC read-only and runs `sleep 3600` as its command.
-//  2. Waits for the pod to reach the Running phase.
-//  3. Uses client-go's remotecommand (SPDY/WebSocket exec) to run
-//     `tar -c [-C /data . | --newer-mtime=T -C /data .]` inside the pod
-//     and streams the tar output directly to a file on the backup PVC
-//     (which is already mounted by the replic2 controller itself).
-//     This avoids mounting the backup PVC inside the agent pod entirely,
-//     so there is no RWO conflict on multi-node clusters.
-//  4. Deletes the agent pod regardless of outcome.
+//     the source PVC read-only.  The pod's command IS the tar invocation,
+//     writing the archive to stdout.  No backup PVC is mounted in the agent
+//     pod — the backup PVC is only ever mounted by the replic2 controller.
 //
-// For incremental backups, "--newer-mtime=<RFC3339>" is prepended to the
-// tar command so only files modified after the previous backup's completedAt
-// are included in the archive.
+//  2. Waits for the pod to reach Succeeded or Failed by polling its phase.
+//     The pod terminates itself as soon as tar exits — no exec, no SPDY, no
+//     force-kill needed.
+//
+//  3. Streams the pod's logs (tar's stdout) directly to an archive file on
+//     the backup PVC, which is already mounted in this process.
+//
+//  4. Deletes the pod via defer — by the time the defer runs the pod is
+//     already in the Succeeded phase, so the delete just removes a completed
+//     pod rather than killing a live one.
+//
+// For incremental backups, "--newer-mtime=<RFC3339>" is prepended to the tar
+// command so only files modified after the previous backup's completedAt are
+// included in the archive.
+//
+// Archive naming:
+//   - Full:        <pvcDataDir>/<pvcName>.tar
+//   - Incremental: <pvcDataDir>/<pvcName>-incremental.tar
 package backup
 
 import (
 	"context"       // for cancellation / deadlines
 	"fmt"           // for error wrapping
+	"io"            // for io.Copy (stream logs to archive file)
 	"log"           // for structured logging
 	"os"            // for MkdirAll and Create (write archive to backup PVC)
 	"path/filepath" // for Join (build archive path)
@@ -30,10 +40,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"                   // Pod, PVC types and phase constants
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // ObjectMeta, ListOptions, DeleteOptions
-	"k8s.io/client-go/kubernetes/scheme"          // ParameterCodec for PodExecOptions
-	"k8s.io/client-go/tools/remotecommand"        // SPDY/WebSocket exec streaming
 
-	"replic2/internal/k8s"            // Kubernetes client wrapper (c.REST, c.Core)
+	"replic2/internal/k8s"            // Kubernetes client wrapper (c.Core)
 	apitypes "replic2/internal/types" // Backup struct (b.Name for logging/labels)
 )
 
@@ -75,40 +83,35 @@ func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, 
 	return nil
 }
 
-// backupSinglePVC spawns an agent pod that mounts pvcName read-only, then
-// execs `tar` inside it and streams the output directly to an archive file on
-// the replic2 backup PVC (which is already mounted in this process).
-//
-// Archive naming:
-//   - Full:        <pvcDataDir>/<pvcName>.tar
-//   - Incremental: <pvcDataDir>/<pvcName>-incremental.tar
-//
-// Because the backup PVC is never mounted inside the agent pod, this approach
-// works on multi-node clusters with RWO backup PVCs.
+// backupSinglePVC spawns an agent pod whose command IS the tar invocation.
+// tar writes to stdout, which the Kubernetes log API captures.  Once the pod
+// reaches Succeeded the controller streams the pod logs to an archive file on
+// the backup PVC.  The pod is then deleted (it is already completed by that
+// point, so no force-kill occurs).
 func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, pvcDataDir, pvcName string, sinceTime time.Time) error {
 	// -----------------------------------------------------------------------
-	// 1. Decide archive name and build the tar command to exec in the pod.
+	// 1. Decide archive name and build the tar command (pod's entrypoint).
+	//    tar writes the archive to stdout (no -f flag = stdout by default).
 	// -----------------------------------------------------------------------
-	archiveName := pvcName + ".tar" // default: full backup
+	archiveName := pvcName + ".tar" // full backup
 	if !sinceTime.IsZero() {
 		archiveName = pvcName + "-incremental.tar" // incremental backup
 	}
-	archivePath := filepath.Join(pvcDataDir, archiveName) // local path on the backup PVC
+	archivePath := filepath.Join(pvcDataDir, archiveName) // destination on the backup PVC
 
-	// tar writes to stdout ("-" as the output file).
-	// For incremental runs prepend --newer-mtime so only changed files stream.
-	tarCmd := []string{"tar", "-c", "-C", "/data", "."} // full: stream everything
+	// Build the tar argv.  All output goes to stdout so the log API captures it.
+	tarCmd := []string{"tar", "-c", "-C", "/data", "."} // full: archive everything
 	if !sinceTime.IsZero() {
-		// GNU tar accepts RFC3339 for --newer-mtime.
+		// GNU tar --newer-mtime accepts RFC3339 timestamps.
 		tarCmd = []string{
 			"tar",
 			"--newer-mtime=" + sinceTime.UTC().Format(time.RFC3339), // mtime cut-off
-			"-c", "-C", "/data", ".", // stream changed files to stdout
+			"-c", "-C", "/data", ".", // archive only files newer than sinceTime
 		}
 	}
 
 	// -----------------------------------------------------------------------
-	// 2. Build the pod name; truncate to the 63-char DNS label limit.
+	// 2. Build the pod name; truncate to the 63-char Kubernetes DNS label limit.
 	// -----------------------------------------------------------------------
 	podName := fmt.Sprintf("replic2-backup-%s-%s", b.Name, pvcName)
 	if len(podName) > 63 {
@@ -117,30 +120,30 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 
 	// -----------------------------------------------------------------------
 	// 3. Define the agent pod.
-	//    It mounts ONLY the source PVC (read-only).  The backup PVC is never
-	//    mounted here — we stream tar output back to the controller instead.
-	//    The pod runs `sleep 3600` so it stays alive while we exec into it.
+	//    - Mounts the source PVC read-only at /data.
+	//    - Its command IS the tar invocation — it exits as soon as tar finishes.
+	//    - The backup PVC is never mounted here; data flows via the log stream.
 	// -----------------------------------------------------------------------
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
-			Namespace: ns, // same namespace as the source PVC
+			Namespace: ns, // must be in the same namespace as the source PVC
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "replic2", // for kubectl filtering
-				"replic2.io/backup":            b.Name,    // links the pod to its backup
+				"replic2.io/backup":            b.Name,    // links the pod to its backup CR
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever, // do not restart on failure
+			RestartPolicy: corev1.RestartPolicyNever, // run once; do not restart on failure
 			Containers: []corev1.Container{
 				{
 					Name:    "agent",
-					Image:   "busybox:stable",          // provides tar and sleep
-					Command: []string{"sleep", "3600"}, // stay alive for exec window
+					Image:   "busybox:stable", // provides GNU tar
+					Command: tarCmd,           // tar runs as PID 1; pod exits when tar exits
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "source-pvc",
-							MountPath: "/data", // source files appear here
+							MountPath: "/data", // source files are accessible here
 							ReadOnly:  true,    // never modify source data
 						},
 					},
@@ -148,12 +151,12 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 			},
 			Volumes: []corev1.Volume{
 				{
-					// source-pvc: the PVC whose data we are archiving.
+					// source-pvc: the PVC whose data we are archiving (read-only).
 					Name: "source-pvc",
 					VolumeSource: corev1.VolumeSource{
 						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 							ClaimName: pvcName, // the PVC to back up
-							ReadOnly:  true,    // read-only: safe, no accidental writes
+							ReadOnly:  true,    // safe: no accidental writes to source
 						},
 					},
 				},
@@ -161,7 +164,7 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 		},
 	}
 
-	// Clean up any leftover pod from a previous attempt before creating a new one.
+	// Delete any leftover pod from a previous (failed) attempt so Create succeeds.
 	_ = c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
 
 	if _, err := c.Core.CoreV1().Pods(ns).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
@@ -169,19 +172,22 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	}
 	log.Printf("backup controller: [%s] agent pod %q created for PVC %q", b.Name, podName, pvcName)
 
-	// Always delete the pod when we are done, regardless of success or failure.
+	// Always delete the pod when this function returns, regardless of outcome.
+	// In the success path the pod is already Succeeded at this point, so the
+	// delete just removes a completed pod cleanly.
 	defer func() {
 		_ = c.Core.CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
 		log.Printf("backup controller: [%s] agent pod %q deleted", b.Name, podName)
 	}()
 
 	// -----------------------------------------------------------------------
-	// 4. Wait for the pod to reach the Running phase so exec is available.
+	// 4. Poll until the pod reaches a terminal phase (Succeeded or Failed).
+	//    The pod terminates itself as soon as tar exits — no force-kill needed.
 	// -----------------------------------------------------------------------
-	deadline := time.Now().Add(agentPodTimeout) // absolute timeout
+	deadline := time.Now().Add(agentPodTimeout) // absolute deadline
 	for {
 		if time.Now().After(deadline) {
-			return fmt.Errorf("agent pod %q did not reach Running within %s", podName, agentPodTimeout)
+			return fmt.Errorf("agent pod %q timed out after %s", podName, agentPodTimeout)
 		}
 
 		p, err := c.Core.CoreV1().Pods(ns).Get(ctx, podName, metav1.GetOptions{})
@@ -189,86 +195,51 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 			return fmt.Errorf("get agent pod %q: %w", podName, err)
 		}
 
-		if p.Status.Phase == corev1.PodRunning {
-			break // pod is ready for exec
+		switch p.Status.Phase {
+		case corev1.PodSucceeded:
+			// tar finished successfully — proceed to stream logs below.
+			log.Printf("backup controller: [%s] agent pod %q succeeded", b.Name, podName)
+		case corev1.PodFailed:
+			// tar exited non-zero — surface the error.
+			return fmt.Errorf("agent pod %q failed (check pod logs for tar error)", podName)
+		default:
+			// Still Pending or Running — wait and poll again.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second): // poll interval
+			}
+			continue // go back to the top of the loop
 		}
-		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
-			return fmt.Errorf("agent pod %q reached terminal phase %q before exec", podName, p.Status.Phase)
-		}
-
-		// Poll every 2 seconds while waiting for Running.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(2 * time.Second):
-		}
+		break // only reached on PodSucceeded
 	}
 
 	// -----------------------------------------------------------------------
-	// 5. Open the destination archive file on the backup PVC.
-	//    This file lives in the replic2 controller's own mount — we write to
-	//    it by piping the exec stdout stream directly into it.
+	// 5. Stream the pod logs (tar's stdout) into the archive file on the
+	//    backup PVC.  The pod has already exited so the log stream is complete
+	//    and will not block.
 	// -----------------------------------------------------------------------
+	logStream, err := c.Core.CoreV1().Pods(ns).GetLogs(podName, &corev1.PodLogOptions{
+		Container: "agent", // the container whose stdout we want
+	}).Stream(ctx)
+	if err != nil {
+		return fmt.Errorf("get logs for pod %q: %w", podName, err)
+	}
+	defer logStream.Close()
+
+	// Open (or create) the destination archive file on the backup PVC.
 	archiveFile, err := os.Create(archivePath)
 	if err != nil {
 		return fmt.Errorf("create archive file %q: %w", archivePath, err)
 	}
 	defer archiveFile.Close()
 
-	// -----------------------------------------------------------------------
-	// 6. Exec the tar command inside the agent pod and stream stdout here.
-	//    remotecommand uses SPDY (or WebSocket on newer servers) to multiplex
-	//    stdin/stdout/stderr over a single HTTP/2 connection.
-	// -----------------------------------------------------------------------
-	execReq := c.Core.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(ns).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: "agent",
-			Command:   tarCmd, // the tar command to run
-			Stdin:     false,  // we only need output
-			Stdout:    true,   // tar stream goes here
-			Stderr:    true,   // capture stderr for error reporting
-			TTY:       false,  // no terminal needed
-		}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(c.REST, "POST", execReq.URL())
+	// Copy the log stream (tar bytes) directly into the archive file.
+	written, err := io.Copy(archiveFile, logStream)
 	if err != nil {
-		return fmt.Errorf("create SPDY executor for pod %q: %w", podName, err)
+		return fmt.Errorf("stream logs to archive %q: %w", archivePath, err)
 	}
 
-	// stderr is captured into a byte buffer so we can include it in the error.
-	var stderrBuf limitedBuffer
-	streamErr := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: archiveFile, // write tar stream directly to the archive file
-		Stderr: &stderrBuf,  // capture tar's error messages
-	})
-	if streamErr != nil {
-		return fmt.Errorf("exec tar in pod %q: %w (stderr: %s)", podName, streamErr, stderrBuf.String())
-	}
-
-	log.Printf("backup controller: [%s] streamed archive for PVC %q → %s", b.Name, pvcName, archivePath)
+	log.Printf("backup controller: [%s] archived PVC %q → %s (%d bytes)", b.Name, pvcName, archivePath, written)
 	return nil
 }
-
-// limitedBuffer is a simple byte buffer capped at 4 KiB, used to capture
-// stderr from the tar exec without risking unbounded memory growth.
-type limitedBuffer struct {
-	buf []byte
-}
-
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	const maxLen = 4096 // never store more than 4 KiB of stderr
-	if len(b.buf) < maxLen {
-		remaining := maxLen - len(b.buf)
-		if len(p) > remaining {
-			p = p[:remaining] // truncate rather than grow past the cap
-		}
-		b.buf = append(b.buf, p...)
-	}
-	return len(p), nil // always report success so the stream does not abort
-}
-
-func (b *limitedBuffer) String() string { return string(b.buf) }
