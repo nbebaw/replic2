@@ -31,20 +31,6 @@ func BackupRoot() string {
 	return defaultBackupRoot
 }
 
-// defaultBackupPVCName is the Kubernetes PVC name used when BACKUP_PVC_NAME is unset.
-const defaultBackupPVCName = "replic2-backups"
-
-// BackupPVCName returns the name of the PersistentVolumeClaim that replic2
-// uses to store backups.  Agent pods mount this PVC directly (not via HostPath)
-// so they can write tar archives to the same storage as the controller.
-// Override with the BACKUP_PVC_NAME environment variable.
-func BackupPVCName() string {
-	if v := os.Getenv("BACKUP_PVC_NAME"); v != "" {
-		return v
-	}
-	return defaultBackupPVCName
-}
-
 // JSONToYAML converts a JSON byte slice to YAML using the sigs.k8s.io/yaml
 // library (already a transitive dep via client-go).
 func JSONToYAML(j []byte) ([]byte, error) {
