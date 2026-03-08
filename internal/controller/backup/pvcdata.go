@@ -91,27 +91,33 @@ func backupPVCData(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, 
 // point, so no force-kill occurs).
 func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns, pvcDataDir, pvcName string, sinceTime time.Time) error {
 	// -----------------------------------------------------------------------
-	// 1. Decide archive name and build the tar command (pod's entrypoint).
+	// 1. Decide archive name and build the pod command.
 	//    tar writes the archive to stdout (no -f flag = stdout by default).
+	//    The pod command IS the tar/shell invocation — it exits when done.
 	// -----------------------------------------------------------------------
-	archiveName := pvcName + ".tar" // full backup
+	archiveName := pvcName + ".tar"                         // full backup
+	podCommand := []string{"tar", "-c", "-C", "/data", "."} // full: archive everything
+
 	if !sinceTime.IsZero() {
 		archiveName = pvcName + "-incremental.tar" // incremental backup
-	}
-	archivePath := filepath.Join(pvcDataDir, archiveName) // destination on the backup PVC
 
-	// Build the tar argv.  All output goes to stdout so the log API captures it.
-	tarCmd := []string{"tar", "-c", "-C", "/data", "."} // full: archive everything
-	if !sinceTime.IsZero() {
-		// BusyBox tar uses -N <date> for "newer than" filtering.
-		// --newer-mtime is a GNU tar extension not available in BusyBox.
-		// The date format must be "YYYY-MM-DD HH:MM:SS" (UTC).
-		tarCmd = []string{
-			"tar",
-			"-N", sinceTime.UTC().Format("2006-01-02 15:04:05"), // mtime cut-off
-			"-c", "-C", "/data", ".", // archive only files newer than sinceTime
-		}
+		// BusyBox tar has no "newer than date" flag at all.
+		// Workaround: use a shell script that:
+		//   1. Touches a reference file with the exact cutoff timestamp (using
+		//      `touch -d` which BusyBox sh supports via the date built-in).
+		//   2. Uses `find -newer <ref>` to list all files modified after the
+		//      cutoff, writing them to a temp file list.
+		//   3. Feeds that file list to `tar -T` to build the archive.
+		// All output still goes to stdout so the log API captures the tar bytes.
+		ts := sinceTime.UTC().Format("2006-01-02 15:04:05") // BusyBox touch -d format
+		script := fmt.Sprintf(
+			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files`,
+			ts,
+		)
+		podCommand = []string{"sh", "-c", script}
 	}
+
+	archivePath := filepath.Join(pvcDataDir, archiveName) // destination on the backup PVC
 
 	// -----------------------------------------------------------------------
 	// 2. Build the pod name; truncate to the 63-char Kubernetes DNS label limit.
@@ -124,7 +130,9 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	// -----------------------------------------------------------------------
 	// 3. Define the agent pod.
 	//    - Mounts the source PVC read-only at /data.
-	//    - Its command IS the tar invocation — it exits as soon as tar finishes.
+	//    - Full backup:        command is plain tar writing to stdout.
+	//    - Incremental backup: command is a sh script that uses find -newer
+	//      to build a file list, then pipes it to tar via -T.
 	//    - The backup PVC is never mounted here; data flows via the log stream.
 	// -----------------------------------------------------------------------
 	pod := &corev1.Pod{
@@ -141,8 +149,8 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 			Containers: []corev1.Container{
 				{
 					Name:    "agent",
-					Image:   "busybox:stable", // provides GNU tar
-					Command: tarCmd,           // tar runs as PID 1; pod exits when tar exits
+					Image:   "busybox:stable", // provides sh, find, touch, tar
+					Command: podCommand,       // runs as PID 1; pod exits when command exits
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "source-pvc",
