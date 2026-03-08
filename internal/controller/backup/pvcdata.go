@@ -99,12 +99,20 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 	s3Key := fmt.Sprintf("%s/pvc-data/%s", keyPrefix, archiveName)
 	s3URI := fmt.Sprintf("s3://%s/%s", bucket, s3Key) // full s3:// URI for the AWS CLI
 
+	// Build the optional --endpoint-url flag for MinIO / non-AWS S3 providers.
+	// This must be part of the aws command string, not appended outside the
+	// sh -c "..." quoted expression.
+	endpointFlag := ""
+	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
+		endpointFlag = fmt.Sprintf(" --endpoint-url '%s'", endpoint) // leading space intentional
+	}
+
 	// Build the shell command.  For incremental backups we use find -newer to
 	// limit the archive to files modified after sinceTime.
 	var shellCmd string
 	if sinceTime.IsZero() {
 		// Full backup: archive everything under /data.
-		shellCmd = fmt.Sprintf(`tar -c -C /data . | aws s3 cp - '%s'`, s3URI)
+		shellCmd = fmt.Sprintf(`tar -c -C /data . | aws s3 cp - '%s'%s`, s3URI, endpointFlag)
 	} else {
 		// Incremental backup:
 		//   1. Create a reference file with the cutoff timestamp.
@@ -112,16 +120,9 @@ func backupSinglePVC(ctx context.Context, c *k8s.Clients, b *apitypes.Backup, ns
 		//   3. Pipe that file list into tar, then upload to S3.
 		ts := sinceTime.UTC().Format("2006-01-02 15:04:05") // touch -d format
 		shellCmd = fmt.Sprintf(
-			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files | aws s3 cp - '%s'`,
-			ts, s3URI,
+			`touch -d '%s' /tmp/ref && find /data -newer /tmp/ref > /tmp/files && tar -c -C /data -T /tmp/files | aws s3 cp - '%s'%s`,
+			ts, s3URI, endpointFlag,
 		)
-	}
-
-	// Optionally append --endpoint-url for MinIO / non-AWS S3 providers.
-	if endpoint := os.Getenv("S3_ENDPOINT"); endpoint != "" {
-		// Append the flag to the aws s3 cp command inside the pipeline.
-		// We replace the trailing s3URI with s3URI + --endpoint-url flag.
-		shellCmd += fmt.Sprintf(" --endpoint-url '%s'", endpoint)
 	}
 
 	// -----------------------------------------------------------------------
