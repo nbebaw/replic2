@@ -24,6 +24,47 @@ A Kubernetes operator and HTTP server that provides namespace-scoped backup and 
 
 ---
 
+## Deploy with Helm
+
+```bash
+# Install into the replic2 namespace (creates it if absent)
+helm upgrade --install replic2 charts/replic2 \
+  --namespace replic2 --create-namespace \
+  --set imagePullSecret.dockerconfigjson=<base64>
+
+# Uninstall
+helm uninstall replic2 --namespace replic2
+```
+
+Generate the base64 value with:
+
+```bash
+kubectl create secret docker-registry ghcr-pull-secret \
+  --docker-server=ghcr.io \
+  --docker-username=<GITHUB_USER> \
+  --docker-password=<GITHUB_PAT> \
+  --dry-run=client -o jsonpath='{.data.\.dockerconfigjson}'
+```
+
+### Key Helm values
+
+| Value | Default | Description |
+|---|---|---|
+| `replicaCount` | `2` | Number of replic2 pods |
+| `image.repository` | `ghcr.io/nbebaw/replic2` | Container image |
+| `image.tag` | chart `appVersion` | Image tag |
+| `imagePullSecret.create` | `true` | Create the GHCR pull secret |
+| `imagePullSecret.dockerconfigjson` | `""` | base64 .dockerconfigjson (required) |
+| `persistence.size` | `10Gi` | Backup PVC size |
+| `persistence.storageClassName` | `""` | StorageClass (empty = cluster default) |
+| `service.type` | `NodePort` | Service type |
+| `service.nodePort` | `30080` | NodePort number |
+| `autoscaling.enabled` | `true` | Enable HPA |
+| `autoscaling.minReplicas` | `2` | HPA min replicas |
+| `autoscaling.maxReplicas` | `10` | HPA max replicas |
+
+---
+
 ## Custom Resources
 
 ### Backup a namespace
@@ -147,7 +188,7 @@ Override the root path with the `BACKUP_ROOT` environment variable (default: `/d
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | HTTP listen port |
-| `APP_VERSION` | `0.1.0` | Reported in `GET /` |
+| `APP_VERSION` | `0.2.0` | Reported in `GET /` |
 | `POD_NAMESPACE` | `default` | Namespace for leader election Lease |
 | `POD_NAME` | OS hostname | Leader election identity |
 | `BACKUP_ROOT` | `/data/backups` | PVC mount path for backup storage |
@@ -206,14 +247,15 @@ Always run both before committing.
 
 ---
 
-## Deployment
+## Deploy with raw manifests
 
-Apply manifests in this order:
+Apply in this order if not using Helm:
 
 ```bash
 kubectl apply -f deploy/namespace.yaml
 kubectl apply -f deploy/crd-backup.yaml
 kubectl apply -f deploy/crd-restore.yaml
+kubectl apply -f deploy/crd-scheduledbackup.yaml
 kubectl apply -f deploy/rbac.yaml
 kubectl apply -f deploy/serviceaccount.yaml
 kubectl apply -f deploy/pvc.yaml
@@ -222,6 +264,8 @@ kubectl apply -f deploy/deployment.yaml
 kubectl apply -f deploy/service.yaml
 kubectl apply -f deploy/hpa.yaml
 ```
+
+> `deploy/` is gitignored — manifests live locally only.
 
 ---
 
@@ -242,6 +286,22 @@ Built automatically via GitHub Actions on every push to `main`.
 replic2/
 ├── main.go                                 — entry point; wires clients, HTTP server, leader election
 ├── main_test.go                            — HTTP handler integration tests
+├── charts/replic2/                         — Helm chart
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   └── templates/
+│       ├── _helpers.tpl
+│       ├── serviceaccount.yaml
+│       ├── rbac.yaml
+│       ├── pvc.yaml
+│       ├── secret-ghcr.yaml
+│       ├── deployment.yaml
+│       ├── service.yaml
+│       ├── hpa.yaml
+│       └── crds/
+│           ├── crd-backup.yaml
+│           ├── crd-restore.yaml
+│           └── crd-scheduledbackup.yaml
 └── internal/
     ├── k8s/client.go                       — Kubernetes client initialisation
     ├── types/types.go                      — CRD Go types + scheme registration
@@ -257,7 +317,12 @@ replic2/
     │       ├── healthzApi.go               — /healthz handler
     │       └── readyzApi.go                — /readyz handler
     └── controller/
-        ├── backup/backup.go                — Backup controller
+        ├── backup/
+        │   ├── backup.go                   — poll loop, constants, exported wrappers
+        │   ├── process.go                  — process(), FindLatestCompletedBackup()
+        │   ├── manifests.go                — resource type discovery, VerbSupported()
+        │   ├── pvcdata.go                  — agent pod + log streaming for PVC data
+        │   └── status.go                   — status patching, expiry helpers
         ├── restore/restore.go              — Restore controller
         └── scheduled/scheduled.go         — ScheduledBackup controller
 ```

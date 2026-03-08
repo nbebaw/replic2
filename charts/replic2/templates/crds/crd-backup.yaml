@@ -1,0 +1,87 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: backups.replic2.io
+spec:
+  group: replic2.io
+  scope: Cluster
+  names:
+    plural: backups
+    singular: backup
+    kind: Backup
+    shortNames:
+      - bk
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - namespace
+              properties:
+                namespace:
+                  type: string
+                  description: "The namespace to back up."
+                type:
+                  type: string
+                  enum: [Full, Incremental]
+                  description: "Backup type. Omit to auto-select: Full on first run, Incremental after."
+                includePVCData:
+                  type: boolean
+                  default: false
+                  description: "When true, also copy raw data from every bound PVC via a temporary agent pod."
+                ttl:
+                  type: string
+                  description: "Optional retention duration (e.g. 24h, 168h). CR and PVC data are deleted after completedAt + ttl."
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, InProgress, Completed, Failed]
+                message:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                completedAt:
+                  type: string
+                  format: date-time
+                storagePath:
+                  type: string
+                  description: "Path on the PVC where this backup was written."
+                backupType:
+                  type: string
+                  enum: [Full, Incremental]
+                  description: "The backup type that was actually performed."
+                basedOn:
+                  type: string
+                  description: "Name of the Backup CR this incremental is built on. Empty for full backups."
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Namespace
+          type: string
+          jsonPath: .spec.namespace
+        - name: Type
+          type: string
+          jsonPath: .status.backupType
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Based On
+          type: string
+          jsonPath: .status.basedOn
+        - name: Storage Path
+          type: string
+          jsonPath: .status.storagePath
+        - name: Completed
+          type: string
+          jsonPath: .status.completedAt

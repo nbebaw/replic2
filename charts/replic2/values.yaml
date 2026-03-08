@@ -1,0 +1,90 @@
+# Default values for replic2.
+# Override any of these with: helm install replic2 ./charts/replic2 --set key=value
+
+# -- Number of replic2 pod replicas. Minimum 2 for HA leader election.
+replicaCount: 2
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/nbebaw/replic2
+  # -- Image tag. Defaults to the chart appVersion.
+  tag: ""
+  # -- Image pull policy
+  pullPolicy: Always
+
+# -- Image pull secret name for GHCR (or any private registry).
+#    The secret must already exist in the namespace, or set imagePullSecret.create=true.
+imagePullSecret:
+  # -- Create the dockerconfigjson secret from the values below.
+  #    Set to false if you create the secret out-of-band.
+  create: true
+  # -- Name of the secret
+  name: ghcr-pull-secret
+  # -- base64-encoded .dockerconfigjson value.
+  #    Generate with:
+  #      kubectl create secret docker-registry ghcr-pull-secret \
+  #        --docker-server=ghcr.io \
+  #        --docker-username=<USER> \
+  #        --docker-password=<PAT> \
+  #        --dry-run=client -o jsonpath='{.data.\.dockerconfigjson}'
+  dockerconfigjson: ""
+
+# -- Application version reported by GET /
+appVersion: "0.2.0"
+
+# -- HTTP port the container listens on
+port: 8080
+
+# -- Root path on the backup PVC where backups are written.
+#    Must match the volumeMount.mountPath below.
+backupRoot: /data/backups
+
+# Backup PVC configuration
+persistence:
+  # -- Storage size for the backup PVC
+  size: 10Gi
+  # -- StorageClass name. Leave empty to use the cluster default.
+  storageClassName: ""
+  # -- Access mode for the backup PVC
+  accessMode: ReadWriteOnce
+
+# Service configuration
+service:
+  # -- Service type
+  type: NodePort
+  # -- Port exposed by the Service
+  port: 80
+  # -- NodePort number (only used when type=NodePort). Leave 0 to let Kubernetes assign one.
+  nodePort: 30080
+
+# HPA configuration
+autoscaling:
+  # -- Enable the HorizontalPodAutoscaler
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  # -- Target CPU utilisation percentage
+  targetCPUUtilizationPercentage: 70
+  # -- Target memory utilisation percentage
+  targetMemoryUtilizationPercentage: 80
+
+# Resource requests and limits for the replic2 container
+resources:
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+  limits:
+    cpu: "200m"
+    memory: "128Mi"
+
+# Liveness probe settings
+livenessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+
+# Readiness probe settings
+readinessProbe:
+  initialDelaySeconds: 3
+  periodSeconds: 5
+  failureThreshold: 3

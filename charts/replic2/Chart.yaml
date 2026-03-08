@@ -1,0 +1,16 @@
+apiVersion: v2
+name: replic2
+description: Kubernetes namespace backup and restore operator
+type: application
+version: 0.1.0
+appVersion: "0.2.0"
+keywords:
+  - backup
+  - restore
+  - operator
+  - kubernetes
+home: https://github.com/nbebaw/replic2
+sources:
+  - https://github.com/nbebaw/replic2
+maintainers:
+  - name: nbebaw

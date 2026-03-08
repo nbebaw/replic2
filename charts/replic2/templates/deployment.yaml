@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "replic2.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "replic2.labels" . | nindent 4 }}
+    component: server
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "replic2.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "replic2.selectorLabels" . | nindent 8 }}
+        component: server
+    spec:
+      serviceAccountName: {{ include "replic2.fullname" . }}
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecret.name }}
+      containers:
+        - name: replic2
+          image: {{ include "replic2.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.port }}
+              protocol: TCP
+          env:
+            - name: PORT
+              value: {{ .Values.port | quote }}
+            - name: APP_VERSION
+              value: {{ .Values.appVersion | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: BACKUP_ROOT
+              value: {{ .Values.backupRoot | quote }}
+          volumeMounts:
+            - name: backups
+              mountPath: {{ .Values.backupRoot }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop:
+                - ALL
+      securityContext:
+        fsGroup: 65534
+      volumes:
+        - name: backups
+          persistentVolumeClaim:
+            claimName: {{ include "replic2.fullname" . }}-backups

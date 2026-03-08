@@ -1,0 +1,66 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: restores.replic2.io
+spec:
+  group: replic2.io
+  scope: Cluster
+  names:
+    plural: restores
+    singular: restore
+    kind: Restore
+    shortNames:
+      - rst
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - namespace
+              properties:
+                namespace:
+                  type: string
+                  description: "The namespace to restore."
+                backupName:
+                  type: string
+                  description: "Optional: name of the specific Backup CR to restore from. Defaults to the most recent backup for the namespace."
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, InProgress, Completed, Failed]
+                message:
+                  type: string
+                startedAt:
+                  type: string
+                  format: date-time
+                completedAt:
+                  type: string
+                  format: date-time
+                restoredFrom:
+                  type: string
+                  description: "The storage path the restore was read from."
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Namespace
+          type: string
+          jsonPath: .spec.namespace
+        - name: Backup Name
+          type: string
+          jsonPath: .spec.backupName
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Completed
+          type: string
+          jsonPath: .status.completedAt

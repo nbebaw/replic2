@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "replic2.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "replic2.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "replic2.selectorLabels" . | nindent 4 }}
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}

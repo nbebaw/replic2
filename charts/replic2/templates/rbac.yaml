@@ -1,0 +1,88 @@
+---
+# ClusterRole grants replic2 the permissions it needs across all namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "replic2.fullname" . }}
+  labels:
+    {{- include "replic2.labels" . | nindent 4 }}
+rules:
+  # ---- Core workload resources (backup reads, restore writes) ----
+  - apiGroups: [""]
+    resources:
+      - serviceaccounts
+      - configmaps
+      - persistentvolumeclaims
+      - services
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  # ---- Agent pods (spawned in target namespaces for PVC data backup) ----
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+    verbs: ["get", "list", "create", "delete"]
+
+  # ---- Workload controllers (backup reads, restore writes) ----
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  # ---- Ingresses (backup reads, restore writes) ----
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  # ---- Namespace management (restore may need to recreate a namespace) ----
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "create"]
+
+  # ---- replic2 CRDs ----
+  - apiGroups: ["replic2.io"]
+    resources:
+      - backups
+      - backups/status
+      - restores
+      - restores/status
+      - scheduledbackups
+      - scheduledbackups/status
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+
+  # ---- API discovery (find third-party CRDs at backup time) ----
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources:
+      - customresourcedefinitions
+    verbs: ["get", "list"]
+
+  # ---- Third-party CRD instances (backup reads, restore writes) ----
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "create", "patch", "update"]
+
+  # ---- Leader election Lease ----
+  - apiGroups: ["coordination.k8s.io"]
+    resources:
+      - leases
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "replic2.fullname" . }}
+  labels:
+    {{- include "replic2.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "replic2.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "replic2.fullname" . }}
+    namespace: {{ .Release.Namespace }}
